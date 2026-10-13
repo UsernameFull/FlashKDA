@@ -3,17 +3,9 @@
 //
 //   A_inv = (I + L)^{-1},  A_inv[i,:] = e_i + sum_{j<i} (-L[i][j]) A_inv[j,:]
 //
-// Same recursion as k1_solve_wu.cpp, but the vector lane width is the chunk
-// axis instead of the 16-element row.  On this core a count-mode vector
-// instruction costs ~25-30 cycles of issue however few lanes it fills (three
-// independent probes agree: +8 one-repeat Adds per chunk in the fused kernel,
-// the unroll 4/8/16 sweep there, and the variant timings here), so the old
-// per-chunk Axpy loop paid that 120 times per chunk.  Here one MulAddDst
-// updates row i of *thirty-two* chunks at once: 120 instructions per 32 chunks
-// instead of 120 per chunk.
-//
-// The three pieces of layout that make it work (all verified on hardware with
-// a probe kernel, see docs/ASCENDC_V1_KERNELS.md):
+// Same recursion as the scalar solve, but the vector lane width is the chunk
+// axis.  One MulAddDst updates row i across many chunks at once.  The layout
+// requirements are:
 //   1. Brcb(dst, src, 2*NC, BrcbRepeatParams(1, 8)) reads one 32B block (eight
 //      columns of one chunk) per repeat and writes eight blocks, so block
 //      (16*ch + j) of the expansion holds -L[ch][i][j] eight times over.
@@ -31,19 +23,9 @@
 // and the mask zeroes the diagonal), so the j >= i terms contribute nothing;
 // they are simply not issued.
 //
-// Measured at [1,8192,32] against the per-chunk version, bit-identical on both
-// outputs (fp32 max diff 0.000e+00, every bf16 value equal):
-//   NC =  8  0.2235 ms      NC = 16  0.1285 ms      NC = 32  0.1006 ms
-//   the old kernel                 0.9120 ms
-// NC = 64 does not fit: the four live tiles would need ~190 KB of the 192 KB.
-// What is left is memory traffic - 40 MB per pass (16 MB L read, 16 MB fp32
-// A_inv write, 8 MB bf16 A_inv write) at ~370 GB/s is ~0.11 ms, so the kernel
-// is now at the bandwidth floor rather than the issue floor.
+// NC is bounded by the live-tile UB budget; the caller rounds C up to a whole
+// block and zeroes padded L rows so they solve to identity.
 //
-// C is rounded up to a multiple of NC by the caller, which zeroes the tail rows
-// of L so the padded chunks solve to a harmless identity (api.py, right after
-// the buffer is allocated - an uninitialised tail is not harmless, it is
-// garbage that the substitution turns into inf).
 #include "kernel_operator.h"
 using namespace AscendC;
 
@@ -99,18 +81,14 @@ constexpr int32_t CE = MM;        // SB <= 2: one [M, M] block per chunk
 #endif
 // The L21 tile is [chunk][row][lane]: one contiguous [M, M] block per chunk,
 // which is exactly how the Lneg export is laid out in GM.  The per-chunk
-// stride is MM and the tile totals NCH * MM elements; the old [row][chunk]
-// form walked the tile one coupling row at a time, NCH bursts per call, and
-// cost 32 gather + 32 scatter descriptors per block against these 4 + 4.
+// stride is MM and the tile totals NCH * MM elements.
 
-// ``a16Mode`` is the A16-store ablation (2026-09-23, plan 11.34): the kernel's
-// own share of the solve stage is 55% row recursion and ~45% DMA (L gathers,
-// the bf16 round trip, and the A16/Xb/Lneg exports), so the first thing to
-// price is what dropping the parent-tile writes buys.  0 = production (both
+// ``a16Mode`` selects what the kernel exports.  0 = production (both
 // stores), 1 = no strict-upper blank, 2 = no parent tile at all.  Modes 1/2
 // leave the Cube solve with a partially written operand *on purpose* - they
-// exist to measure the store, not to be correct - and the single-level build
-// (SB == 1), where that tile is the kernel's only output, ignores the mode.
+// are diagnostic modes, not correct production paths - and the single-level
+// build (SB == 1), where that tile is the kernel's only output, ignores the
+// mode.
 extern "C" __global__ __aicore__ void kda_solve_wu_wide(
     GM_ADDR pL, GM_ADDR pEye, GM_ADDR pA32, GM_ADDR pA16, GM_ADDR pXb,
     GM_ADDR pLneg, int32_t C, int32_t a16Mode, int32_t debugStores) {
@@ -128,10 +106,10 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
     // sub-blocks, the assemble kernel the lower-left one) while the Cube solve
     // reads the whole parent tile, so this kernel has to blank it.  The source
     // has to be the full tile: a DataCopyParams source gap of 0 means *no gap*
-    // between bursts, i.e. the rows are read contiguously (measured - with a
-    // one-row buffer the copy walks off its end and stores UB garbage), so the
-    // broadcast the header used to assume would have to be a repeat stride
-    // inside a vector op, not a DMA parameter.
+    // between bursts, i.e. the rows are read contiguously.  With a one-row
+    // buffer the copy walks off its end and stores UB garbage; a broadcast
+    // would have to be a repeat stride inside a vector op, not a DMA
+    // parameter.
     TBuf<TPosition::VECCALC> bZf, bZb;
     pipe.InitBuffer(bZf, MM * 4);
     pipe.InitBuffer(bZb, MM * 2);
@@ -151,9 +129,8 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
 #if KDA_SOLVE_WIDE_SUBB > 1
     LocalTensor<float> zf = bZf.Get<float>();
     LocalTensor<bfloat16_t> zrow = bZb.Get<bfloat16_t>();
-    // The two modes of the ablation (see the signature).  Declared here, not
-    // at the stores: the blank's *source* is built above the recursion, and an
-    // unguarded Duplicate/Cast there would pay for a store that never happens.
+    // The two diagnostic modes (see the signature).  Declared here, not at
+    // the stores: the blank's *source* is built above the recursion.
     const bool writeBlank = (a16Mode == 0);
     const bool writeDiagA16 = (a16Mode <= 1);
 #else
@@ -308,8 +285,7 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
         }
     }
 #if KDA_SOLVE_WIDE_SUBB > 1
-    // One contiguous 2 KB copy per chunk (the tile is already [chunk][row]):
-    // the per-row scatter this replaces cost 32 small descriptors per block.
+    // One contiguous 2 KB copy per chunk (the tile is already [chunk][row]).
     for (int32_t ch = 0; ch < NCH; ++ch) {
         DataCopy(Lneg[static_cast<uint64_t>(c0 + ch) * CE], l21b[ch * CE],
                  DataCopyParams(1, CE / 16, 0, 0));

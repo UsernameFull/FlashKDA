@@ -2,102 +2,32 @@
 //
 //   X21 = X22 @ Lneg21 @ X11                (all three [M, M], M = KDA_CHUNK/2)
 //
-// With KDA_SOLVE_WIDE_SUBB = 2 the wide kernel solves the two diagonal M x M
-// triangles of every KDA_CHUNK-sized chunk instead of the whole chunk: the
-// row recursion costs M^3/2 vector lanes per chunk, so halving the depth
-// quarters the vector work, and the instances of its tile become (sub-block,
-// chunk) pairs.  What is left of the chunk-sized inverse is the coupling
-// block of the 2x2 block inverse
+// With KDA_SOLVE_WIDE_SUBB = 2, the wide kernel solves the two diagonal M x M
+// triangles.  This kernel forms the remaining lower-left coupling block of the
+// 2x2 block inverse
 //
 //   A_inv = [[X11, 0], [-X22 L21 X11, X22]]
 //
-// which holds for I + L split as [[I+L11, 0], [L21, I+L22]] (L strictly
-// lower).  X11 / X22 arrive contiguous from the wide kernel (Xb) next to the
-// parent-tile copies the Cube solve already consumes, and Lneg21 is its
-// negated bf16 export, so this kernel only has to form that block and write
-// it into the parent A16 tile - kda_solve_wu_cube_kernel stays untouched.
+// which holds for I + L split as [[I+L11, 0], [L21, I+L22]] with L strictly
+// lower.  X11/X22 arrive in Xb, and Lneg21 is the negated bf16 export.  This
+// kernel is the only writer of the parent tile's lower-left block.
 // This kernel's output is the only writer of the parent tile's lower-left
 // block; the wide kernel writes its diagonal and zeroes its strict upper
 // triangle (the Cube solve reads all of it).
 //
-// The intermediate P = Lneg21 @ X11 goes through GM because L0C has no path
-// back into L0A/L0B; splitting the two Mmads into two passes keeps that round
-// trip off the per-chunk critical path (only the boundary between the passes
-// has to drain), and both passes stream like the Cube solve does: the L1
-// loads of every chunk of a pass are issued before its arithmetic starts.
+// P = Lneg21 @ X11 goes through GM because L0C has no path back into
+// L0A/L0B.  The two Mmads are split into passes, with each pass's L1 loads
+// issued before its arithmetic.  `loadMode` selects the load/store path:
 //
-// Both paths are the same arithmetic in the same L1 layout;
-// tools/probe_solve_assemble_coalesce.py checks the two are bit-identical
-// (P and A16) before it times either, and the mode is a runtime argument
-// (api.asm_load_mode(), KDA_ASM_LOADS) so the same binary can be flipped.
+//   0  one B1 queue per operand and per-chunk calls
+//   1  explicit B1 buffers with batched A/B loads
+//   2  mode 1 plus P retained on chip in NZ; pass 1 builds L0B from that
+//      region with LoadDataWithTranspose
+//   3  mode 2 plus a batched pass-1 A16 store
+//   4  mode 2 plus one whole-window Xb fill for both passes
+//   5  mode 3 and mode 4 combined
 //
-// Load path (section 11.37): the shipped form issues six ND2NZ calls per chunk
-// (one 2 KB whole-tile A load plus two 1 KB B bands per pass, 1.37 KB and
-// 4.25 ns per call) and the block's traffic alone measured 0.313-0.339 ms for
-// 100.7 MB against the Cube solve's 839 GB/s cold-path marginal rate, so the
-// transfers - not the bytes - were the floor.  The sources are uniformly
-// strided (Lneg chunk-contiguous, Xb's pass-1 block 2*MM apart, P
-// chunk-contiguous, and a [M, M] tile's two 16-row bands are 1 KB apart in all
-// three), so Nd2NzParams' ndNum can carry several ND matrices per call:
-//
-//   mode 0  shipped: one B1 queue per operand (per-chunk EnQue/DeQue gives the
-//           per-chunk load -> LoadData pipelining), per-chunk calls
-//   mode 1  batched: one explicit B1 buffer per operand, the A operand in one
-//           call per block, a chunk's two B bands merged (ndNum = KF), and in
-//           pass 1 the whole block's B operand in one 8 KB call.  Pass 0 is
-//           1 + NC calls and pass 1 is 2, against 3 * NC each.
-//   mode 2  mode 1 plus P on chip (docs section 11.39): pass 0's fixpipe
-//           writes P into L1 in NZ (CFG_NZ, the same F322BF16 quantization)
-//           instead of its own GM tile, pass 1 builds L0B from that region
-//           with LoadDataWithTranspose, and the GM tile is neither written nor
-//           read - 100.7 MB per call instead of 151.0, and the probe measured
-//           0.096 ms of the round trip's 0.107 ms ceiling.  The NZ fractal
-//           order is [n-block][k-block] where the Nd2Nz band-major source was
-//           [k-block][n-block], so the four 16x16 fractals go into L0B in the
-//           order 0, 2, 1, 3 - A16 is bit-identical to mode 0, which is what
-//           says the mapping is right.
-//   mode 4  mode 2 plus the whole-window fill (the candidate this file was
-//           last measured for): the block's Xb span [c0*2*MM, (c0+nch)*2*MM)
-//           is contiguous in GM as 4*nch 16-row bands, so ONE ND2NZ call
-//           covers pass 0's B (band 0 of each chunk's window) and pass 1's A
-//           (band 1, which then needs no fill and reads into L0A in one
-//           straight LoadData instead of the four crossed calls).  The
-//           block's MTE2 drops from 1 + nch + 2 calls to two (the batched
-//           Lneg fill and this one).  P still stays on chip and the store
-//           stays per chunk - this is mode 2 plus the fill, nothing else.
-//           Measured (section 11.50): A16 bit-identical, block wall 3.7475 ->
-//           2.9236 us (-22%), mte2 1.203 -> 0.434 (-64%), isolated ASM 0.540
-//           -> 0.474 ms - and the stage solve is flat (5.957 = 5.957 ms), so
-//           mode 2 stays the default and this is the switch to flip if the
-//           AIC half ever becomes the exposed one.
-//   mode 3  mode 2 plus the pass-1 A16 store batched (section 11.42,
-//           tools/probe_fixpipe_shape.py): the four lower-left blocks are
-//           PC*PC apart in both the L0C source (srcNdStride = NC * MM / 1024
-//           in 1 KB fractal units = 4) and the GM destination
-//           (dstNdStride = PC * PC, in elements), so one ndNum = nch call
-//           replaces the four strided row-major stores.  The probe measured
-//           the strided form at 0.556 ms against 0.358 for contiguous 2 KB
-//           stores - the row stride itself is the price, and batching is the
-//           only legal way to drop the four descriptors to one.  A16 stays
-//           bit-identical (the probe sweeps srcNdStride and only times the
-//           value that reproduces mode 0).
-//
-// Modes 5-8 of that probe also measured the two structures separately: at the
-// shipped call pattern the queue is worth 0.196 ms over an explicit buffer
-// (0.706 vs 0.901 ms - the per-chunk pipelining hides part of the chain), but
-// with the batched calls the explicit buffer wins (0.531 vs 0.606 ms), which
-// is why mode 1 pairs the batching with the explicit buffer.
-//
-// The queue's NC-deep shape is what pinned KDA_ASM_NCHUNK at 4 (6 and 8
-// deadlock, measured, and re-reproduced at mode 0 as the negative control);
-// the explicit buffer has no such depth constraint, so the fatter block was
-// re-tested (tools/probe_solve_assemble_nc.py): modes 1/2 run NC = 6/8/12/16
-// to completion and are bit-identical to NC = 4, but e2e is flat inside the
-// noise floor (10.389 / 10.390 / 10.392 ms for NC = 4/6/8, median of 3 in one
-// process), so the batched form is not wave-limited at 4 and NC stays 4.
-// That probe also measured the isolated replay to be address-sensitive (the
-// same kernel and NC: 0.15 vs 0.46 ms for different operand allocations), so
-// a block-size verdict has to come from e2e/stage, not from a replay.
+// Mode 0 requires the NC-deep queue shape; NC=4 is the supported depth.
 #include "kernel_operator.h"
 using namespace AscendC;
 
@@ -119,9 +49,8 @@ constexpr int32_t LBSZ = MM * 2;   // one [M, M] bf16 operand
 constexpr int32_t SLOTS = PASSES * NC;  // one L0 slot per (pass, chunk) unit
 
 // One chunk's L0 chain and store, shared by both load paths.  `defer_pass1`
-// (mode 3) suppresses pass 1's A16 store: the caller batches the block's four
-// lower-left blocks into one ndNum call after the chunk loop (section 11.42),
-// so this function leaves the store to it.
+// suppresses pass 1's A16 store when the caller batches the block's four
+// lower-left stores after the chunk loop.
 static __aicore__ inline void assemble_chunk(
     int32_t pass, int32_t slot, bool onchip, bool window,
     LocalTensor<bfloat16_t> la, LocalTensor<bfloat16_t> lb,
@@ -199,23 +128,16 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
     // The assemble only launches at C = 64 in production, so the fallback is
     // for the compile-only legs and any future geometry.
     constexpr bool CAN_BATCH_STORE = (MM % 256) == 0;
-    // Mode 3 is the batched store; mode 4 keeps the per-chunk store (section
-    // 11.42 measured the batching as a stage loss, and the whole-window fill is
-    // orthogonal), so the two knobs do not compose.
-    // Mode 3 (batched store) and mode 4 (whole-window fill) were measured as
-    // separate lines before the AIC half became the wall; docs section 11.61
-    // re-measured both in that regime (each is a real win now) and composes
-    // them as mode 5 = window fill + batched store.
+    // Mode 3 adds a batched store, mode 4 adds the whole-window fill, and
+    // mode 5 composes both.
     const bool batched_store = (loadMode == 3 || loadMode == 5) && CAN_BATCH_STORE;
     const bool window = (loadMode >= 4);
     TPipe pipe;
     TEventID e21 = pipe.AllocEventID<HardEvent::MTE2_MTE1>();
     TEventID e1m = pipe.AllocEventID<HardEvent::MTE1_M>();
     TEventID emf = pipe.AllocEventID<HardEvent::M_FIX>();
-    // Mode 0's L1 shape: one queue per chunk of the block.  The loads of a
-    // whole pass are issued before its arithmetic starts, so a two-deep queue
-    // would stall on the third AllocTensor (that is a deadlock, not a
-    // slowdown - measured).
+    // Mode 0 uses one queue per chunk; NC=4 is required because a whole pass's
+    // loads are issued before its arithmetic begins.
     TQue<QuePosition::B1, NC> qa, qb;
     pipe.InitBuffer(qa, NC, LBSZ);
     pipe.InitBuffer(qb, NC, LBSZ);

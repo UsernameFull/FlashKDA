@@ -1,151 +1,27 @@
-// K1 stages 1+2 fused: input normalisation, gate/decay preparation and the
-// intra-chunk Gram matrices in one AIV block per (batch, head, chunk).
+// K1 fused preprocess and intra-chunk Gram stage.  One AIV block processes one
+// (batch, head, chunk) tile: normalize Q/K, prepare the gate/decay terms, and
+// build the two Gram operands consumed by the paired Cube.
 //
-// The standalone pair costs 3.7 ms at [1,8192,32] and is DMA bound: the
-// preprocess half alone moves 61 KB per chunk (1.0 GB per pass) at ~570 GB/s,
-// and a stub that keeps every DataCopy but drops the whole compute chain still
-// takes 1.79 of its 1.96 ms.  "Qn"/"Kn"/"Gc" are 32 KB per chunk of that
-// traffic and their only consumer is the Gram kernel on the next launch, so
-// folding the two stages together deletes the round trip.
+// Qn/Kn/Gate/Gc GM copies are debug-only and are skipped when their pointers
+// are null; production passes null unless `return_intermediates` is set.
 //
-// The Gram half is unchanged arithmetic and bit-identical to the old
-// kernel's "Aqk32"/"Aqk"/"L" outputs: qf/kf here are the same bf16-rounded,
-// l2-normalised rows the old kernel loaded back from "Qn"/"Kn", and the
-// chunk-centred gate is still the same fp32 value.
+// Per-row scalars use Brcb broadcast: a 16-value tile expands into eight 32B
+// blocks per row, then repeats across 64 lanes once for the low and high
+// halves.  The loop below walks `unroll` chunks; `api.py` chooses 1 for small
+// grids and larger values only when enough chunks fill the device.
 //
-// The GM copies of Qn/Kn/Gate/Gc are debug-only and skipped when the pointer
-// is null ("api.py" passes them only for "return_intermediates").
+// Pass boundaries use two self-paired event pairs, one for the MTE3->V hazard
+// after a stored tile is read back and one for the V->MTE2 hazard before the
+// next pass loads its landing buffers.  Self-paired events carry no loop state,
+// which avoids the priming problem of loop-carried flag pairs on this runtime.
 //
-// Per-row scalars (the l2 norms, beta, the chunk-centred gate) are broadcast
-// with "Brcb" instead of a 16-iteration "Muls"/"Duplicate" loop: Brcb turns the
-// 16 values into a tile with eight 32B blocks per row, and the consumer then
-// runs 64 lanes x 16 repeats with "src1RepStride = 1" block (i.e. one scalar
-// per repeat; "dstRepStride = 16" blocks walks the 128-lane rows), once for the
-// low half and once for the high half.  That is 3 instructions instead of 16
-// plus the 16 scalar "GetValue" reads, and it is bit-identical (measured
-// max(abs(diff)) = 0.000e+00 on all 13 outputs): 3.114 -> 2.679 ms at
-// [1,8192,32] and 1.590 -> 1.373 ms at [1,4096,32].
+// The paired-Cube variant computes Aqk = ga @ gb^T and L = gk1 @ gb^T.  The AIV
+// publishes bf16 operands through a two-deep UB ring and reuses the Aqk32/L
+// slots as the Cube-to-AIV channel; the Cube uses fp32 accumulation.  The mask,
+// scale and bf16 cast remain on the AIV.
 //
-// The kernel is issue-bound, not FLOP-bound (msprof ArithmeticUtilization: the
-// fp32 vector ALU is busy 20% of the block, while a micro-benchmark puts a
-// fixed ~25-35 cycles on every vector instruction, plus ~1-7 cycles per repeat
-// depending on the form).  Three changes follow from that, all bit-identical
-// and worth 2.69 -> 2.59 ms at [1,8192,32]:
-//   * every input load is issued up front behind its own MTE2->V flag and the
-//     wait is deferred to the consumer, so the q/k norms run while G/V/the
-//     masks are still in flight (the block used to wait for all five copies);
-//   * Qg/Kg/Rk/Rv/BetaOut are stored as soon as they exist, so their MTE3
-//     traffic drains behind the Gram loop instead of at the end of the block;
-//   * the two "V_S" sync pairs around the l2 norms are dead (nothing reads
-//     those reductions with the scalar unit any more) and cost ~2%.
-//
-// The block walks `unroll` consecutive chunks (the body is byte-identical,
-// just wrapped in the loop) because the whole kernel is issue-bound and every
-// block pays a fixed setup cost worth ~10% of one chunk's work: 2.679 ->
-// 2.342 ms at [1,8192,32] with unroll 8, 0.333 -> 0.308 ms at [1,1024,32]
-// with unroll 4, 0.0953 -> 0.0932 ms at [2,1024,4] with unroll 2, all
-// bit-identical.  Back-to-back-launch measurements (host launch overhead
-// hidden) put the optimum at >= 256 blocks; at chunk counts under 256 the
-// loop wrapper itself costs ~6%, so `api.py` leaves those at unroll 1.
-//
-// A last pass deleted four more instructions per chunk, again bit-identical
-// (0.000e+00 on all 13 outputs, 2.289 -> 2.262 ms at [1,8192,32] with the same
-// back-to-back harness):
-//   * "Muls(gf, gf, aexp)" followed by "Muls(gf, gf, -1)" is one "Muls" with
-//     the negated scalar (a sign flip is exact, so this is not a rounding
-//     change);
-//   * "Muls(t2, t2, -1.0f)" after "gf - gf[15]" is the same as computing
-//     "gf[15] - gf" directly - swap the two "Sub" operands *and* their repeat
-//     strides (src0 is the fixed row, so its stride is the 0 one);
-//   * the A-side triangular mask multiply is a no-op: the Gram loop writes
-//     exactly the lower triangle and "Duplicate" already put zeros above it,
-//     so "Muls(ga32, redA, scale)" is the whole post-processing - and the
-//     "MaskS" tile no longer has to be fetched.  "MaskL" has to stay, because
-//     the K-side loop does write L's diagonal and the mask is what zeroes it.
-//
-// The fast path has no "PipeBarrier<PIPE_ALL>" left except the one after the
-// last "post_gram" (the "Gate"/"Gc" ones only run when the caller asks for
-// intermediates).  The "Decay" store needs only the MTE3->V half:
-// "SetFlag<HardEvent::MTE3_V>" after the copy, "WaitFlag<HardEvent::MTE3_V>"
-// before the "Mul" that overwrites the tile - 2.259 -> 2.209 ms at
-// [1,8192,32] (R=10, unroll 8, bit-identical), in-pipeline "pre_gram"
-// 2.285 -> 2.237 ms of a 7.463 -> 7.433 ms pass.
-//
-// The pass boundary (and with it the chunk boundary) is two *self-paired*
-// pairs, one per hazard, not a drain and not a loop-carried flag chain: the
-// MTE3->V drain at the end of the pass body covers "MTE3 read of a stored
-// tile -> V write of that tile", and the V->MTE2 marker at the last
-// landing-buffer read (the rv cast) covers "V read of qnb/knb/rvb -> the next
-// pass's DataCopyPad".  Self-paired means no state crosses the iteration, so
-// the priming problem that hangs loop-carried pairs here does not arise; a
-// WaitFlag only orders its own pipe's queue, which is why the two hazards need
-// two pairs and why a single MTE3->V drain left the loads a pass ahead.  See
-// docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md sections 11.12/11.13.
-//
-// Cost model from probes on this kernel (+8 instructions per chunk, launch
-// time at [1,8192,32]): +0.040 ms for 8 one-repeat "Adds" => ~27 cycles per
-// vector instruction, +0.056 ms for 8 "Mul"s with 16 repeats => ~0.6 cycles
-// per extra repeat, +0.051 ms for 8 one-repeat "Exp" => the special-function
-// unit is dearer per repeat but does not dominate.  msprof agrees: the vector
-// pipe is busy 70% of this kernel and the instruction count, not the lane
-// count, is what it waits on.
-//
-// Negative results, worth not retrying: dropping the 15 barriers of the gate
-// cumsum and/or the 64 of the Gram loop changes nothing (the vector pipe is
-// in-order, so they are free); giving the Gram loop a second product tile so
-// the A and K halves stop serialising on one buffer changes nothing (the pipe
-// is issue-limited, not latency-limited); 256B UB padding on "gb" or "redA"
-// costs 4.5% and on "ga"/"gtb" nothing, so the natural layout is already the
-// good one; unroll 4/16/32 are all worse than 8.  (An earlier revision of this
-// note priced "move the Gram to the Cube" as a wash at this kernel's own
-// ~370 GB/s; that was wrong - the publishes ride an idle MTE3, see below.)
-//
-// ---------------------------------------------------------------------------
-// MIX variant (this file): the two intra-chunk Grams move to the paired Cube.
-//
-// A stub of the vector-only block with just the 32-iteration Gram loop deleted
-// runs 1.158 ms against 2.205 ms for the whole block at [1,8192,32]
-// (back-to-back launches, MIN of 10), so the Gram half is 1.05 ms, 47% of the
-// stage, and it is the one part of the chunk the vector unit is bad at: 32
-// row-broadcast multiplies plus 32 whole-row reductions against a handful of
-// instructions for every other step.  msprof agrees the block has no vector
-// headroom left (aiv_vec_ratio 0.845).
-//
-// The split needs three things:
-//   * the operands (ga = qf*exp2(gz), gk1 = ga's K side times beta,
-//     gb = kf*exp2(-gz)) rounded to bf16 and published to GM: 12 KB per chunk.
-//     A store-headroom probe measured 24 KB/chunk of extra MTE3 at 0.047 ms of
-//     the 2.2 ms block, so the traffic is nearly free;
-//   * the Cube side: Aqk = ga @ gb^T and L = gk1 @ gb^T as two 16x16x128 Mmads
-//     that share one L0B operand.  Neither side needs a transpose: Nd2Nz of the
-//     [16,128] tile plus a *plain* LoadData, read as B[K=128,N=16] with
-//     MmadParams(16,16,128), is the transposed operand (probe in
-//     /tmp/kdaval/cubeprobe);
-//   * a software pipeline so the cross-core round trip is off the critical
-//     path.  The AIV masks chunk u-1's Gram (which the Cube finished while it
-//     computed chunk u) and only then publishes chunk u, so the Cube has a
-//     whole chunk of vector work to answer in; the AIC is paired with two AIVs
-//     (MIX_AIC_1_2) and computes both subcores' Grams per step, which leaves it
-//     at ~25% duty.  The Aqk32/L slots double as the
-//     Cube->AIV channel (2 KB read + 2 KB write per chunk) so no new buffer is
-//     needed for the Gram results; the mask, the scale and the bf16 cast stay
-//     on the AIV.
-//
-// Precision: the Cube forms the same products the vector loop did (both
-// operands are exactly bf16 after the cast) with an fp32 accumulator, so the
-// only difference is the operand rounding - measured end to end through the
-// whole KDA pipeline in docs/ASCENDC_V1_KERNELS.md.
-//
-// The AIV publishes through a two-deep UB ring: the slot written for chunk u
-// was last read by the Cube at step u-2, and the DONE wait for chunk u-1 sits
-// between them, so the WAR is covered by the handshake rather than by an extra
-// loop-carried flag (those hang in this runtime, see the note below).
-//
-// NOTE: the body below is sensitive to how it is written - an equivalent
-// rewrite that only reformats the buffer declarations or moves the
-// "PipeBarrier<PIPE_V>" after the gate re-centring loop trips an aivec error
-// (mte error info 0x8030860ef, pc offset ~0x3d8) on this CANN runtime.  Keep
-// the layout of this file; verified working on 910_9382 / CANN 9.1.0.
+// The body is layout-sensitive on this CANN runtime.  Preserve the declaration
+// order and pipeline placement unless revalidated on the target hardware.
 //
 #include "kernel_operator.h"
 using namespace AscendC;
@@ -168,19 +44,10 @@ constexpr int32_t NP = M / MT;      // passes over one chunk
 constexpr int32_t NG = MT * D;      // elements in one pass tile
 constexpr int32_t KF = M / 16;      // 16-row fractal bands of a chunk tile
 constexpr int32_t DF = D / 16;
-// The gate reference has to sit inside the *band* its rows belong to.  One
-// reference for the whole chunk gives both Gram operands exponents of +-M/2
-// rows' worth of gate; the gate cumsum can drop the full lower bound (-5) per
-// row, so at CHUNK = 64 that reaches exp(+-160) - past the fp32 and bf16 exp
-// range of exp(88) - and the operands of every element of the A/L tiles turn
-// into inf or 0 (measured: Aqk32 -> inf -> W/U/out NaN on a legal raw gate,
-// C=16 finite on the same tensors, docs section 11.22).  Bands of BS rows cap
-// the exponent at BS/2 rows' worth, which at BS = 32 is exp(+-80) = 5.5e34 and
-// keeps ~2000x of headroom.  The Gram's (1, 0) block is the one block whose two
-// operands come from *different* bands, so its k side is published a second
-// time under band 1's centre (see the header note).  At M <= 32 there is a
-// single band, the reference row is M/2 = MID0 exactly as before, and every
-// branch below compiles away - the C=16 build is bit-identical.
+// Gate references are per band.  Recentering within BS rows keeps the gated
+// exponents inside fp32/bf16 range for CHUNK=64.  The (1, 0) Gram block spans
+// two bands, so its k side is republished under the adjacent band's reference;
+// smaller chunks have one band and the extra branch compiles away.
 constexpr int32_t BS = M > 32 ? 32 : M;   // rows per gate band
 constexpr int32_t MID0 = BS / 2;          // band 0's reference row
 constexpr bool XBAND = M > BS;            // is there a second gate band?
@@ -190,9 +57,9 @@ constexpr float EPS = 1e-6f;
 // Cross-core flag channels (mode 2 = this AIC and its two AIVs).  The
 // AIV->AIC direction is an *AND over the group's subcores*: a wait on the AIC
 // is satisfied only once both AIVs have set that flagId, and it consumes both
-// bits at once (probe /tmp/miniflag.cpp: one subcore setting, or two channels
-// with one set each, never satisfies a wait; both setting the same id always
-// does).  So a per-subcore channel cannot carry a step, and an AIC that waits
+// bits at once.  One subcore setting, or two channels with one set each,
+// never satisfies a wait; both setting the same id always does.  So a
+// per-subcore channel cannot carry a step, and an AIC that waits
 // twice per step instead of once deadlocks.  Both subcores therefore set one
 // shared READY per step and the AIC waits it once.  The flag is also a level,
 // not a count: the publish has to sit *after* the previous step's DONE wait,
@@ -223,14 +90,9 @@ static __aicore__ inline void RowReduce(LocalTensor<float> rs, LocalTensor<float
 // chunk `c` into the Aqk32/L slots.  Mask, scale and the Aqk16 rounding stay
 // on the vector unit (2 KB read + 2 KB write per chunk, no extra GM buffer).
 //
-// R3: the band staging is a two-deep TQue ring rather than one set of tiles
-// plus a trailing "PipeBarrier<PIPE_ALL>".  That barrier only kept the next
-// band's MTE2 loads out of the UB the current band's MTE3 stores were still
-// reading; a queue's slot is one the compiler tracks a consumer for (MTE3 for
-// "qout"/"qo16"), so the WAR is covered by the queue's own events and the
-// drain disappears.  Measured at [1, 8192, 96, 128] / CHUNK = 64: deleting
-// the two drains outright is worth 0.078 (masks) + 0.24 (band) ms, and this
-// rewrite lands 4.039 -> 3.931 ms, bit-identical on all 13 outputs.
+// Band staging uses a two-deep TQue ring.  Queue ownership provides the WAR
+// protection between the current band's MTE3 stores and the next band's MTE2
+// loads without a broad pipeline drain.
 static __aicore__ inline void post_gram(TQue<TPosition::VECIN, 2>& qin,
                                         TQue<TPosition::VECIN, 2>& qmk,
                                         TQue<TPosition::VECOUT, 2>& qout,
@@ -245,22 +107,13 @@ static __aicore__ inline void post_gram(TQue<TPosition::VECIN, 2>& qin,
                                         bool keepAqk32) {
     const uint64_t m0 = static_cast<uint64_t>(c) * M * M;
     CrossCoreWaitFlag(FL_DONE);
-    // P2-1: the two triangular masks are the same [M, M] tile for every chunk
-    // of every block, so their *bit* form - the only thing the select consumes
-    // - is built once per block into mbitsAll and read back band by band.  The
-    // old form re-read 2 x 16 x M fp32 from GM and re-ran the two Compares for
-    // every band of every chunk, which at KDA_CHUNK = 64 is 8 DataCopy and 128
-    // vector instructions per chunk; the bits are the same values, so the
-    // outputs stay bit-identical.  mbitsAll holds the S bits first (M * M / 8
-    // bytes), then the L bits, each band's slice contiguous.
+    // The triangular masks are invariant across chunks.  Build their bit form
+    // once per block; `mbitsAll` stores S bits then L bits, with each band's
+    // slice contiguous.
     constexpr int32_t BB = 16 * M / 8;   // bit-mask bytes of one band
-    // One 16-row band at a time.  At KDA_CHUNK = 16 (a single band) this is
-    // exactly the whole-chunk form this function has always used; at
-    // KDA_CHUNK = 64 the whole-chunk staging (two fp32 masks, two fp32 Gram
-    // tiles and the bf16 rounding tile = 72 KB) is a third of the 192 KB of
-    // UB and the kernel faulted with a VEC out-of-bounds.  Every element goes
-    // through the same compare/select/scale/round sequence either way, so the
-    // outputs are bit-identical.
+    // Process one 16-row band at a time.  This keeps the mask, Gram and
+    // rounding tiles within the UB budget for CHUNK=64 while preserving the
+    // same compare/select/scale/round sequence.
     // One-band-ahead (docs 11.60): band 0 is issued once before the loop and
     // every iteration dequeues the current band first, then issues the NEXT
     // band's loads before computing on the current one, so one MTE2 latency is
@@ -302,16 +155,9 @@ static __aicore__ inline void post_gram(TQue<TPosition::VECIN, 2>& qin,
     LocalTensor<float> ga32o = gout, gl32o = gout[NB];
     LocalTensor<uint8_t> gmaskBits = mbitsAll[mm * BB];
     LocalTensor<uint8_t> gmaskBitsL = mbitsAll[M * M / 8 + mm * BB];
-    // The two masks are applied with a select instead of a multiply.  The raw
-    // Gram is the Cube's fp32 accumulation of bf16 gated operands, and inside
-    // the region the mask drops the two exponents are the far ends of the
-    // 2 * CHUNK-row gate cumsum: at KDA_CHUNK = 32 that product overflows fp32
-    // (exp2 of +-230), so `x * 0` turns an Inf/NaN into a NaN and the rounding
-    // below then writes NaN into Aqk16 - which is where a C = 32 run picked up
-    // NaNs in the output (measured with the fp32 torch reference: 50 NaNs in
-    // the Aqk32 upper triangle at [1, 64, 2, 128], none at chunk 16, where the
-    // doubled range still fits: exp2(116) = 8e34 < 3.4e38).  A select keeps the
-    // kept region bit-identical and makes the dropped region exactly 0.
+    // Use a select rather than multiplying by zero: dropped-region values may
+    // be Inf/NaN, and select keeps the kept values intact while forcing the
+    // dropped values to exactly zero.
     if (buildMasks) {
         Compares(gmaskBits, gmaskS, 0.5f, CMPMODE::GT, NB);
         PipeBarrier<PIPE_V>();
@@ -356,13 +202,6 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
                                            int32_t nchunk, int32_t unroll,
                                            int32_t rawMode) {
     const int32_t base = GetBlockIdx() * 2 * unroll;
-    // Ablation arms that price the two raw fp32 Gram tiles (docs 11.48): bit 0
-    // drops the Aqk32 Fixpipe, bit 1 the L one.  Both slots stay allocated and
-    // the AIV band loop still reads them, so a dropping arm computes a wrong
-    // answer by construction - it only ever prices the store, it is never a
-    // shipping mode.  The step's Mmad/M_FIX pairing and the trailing
-    // CrossCoreSetFlag(FL_DONE) are untouched, so post_gram's
-    // CrossCoreWaitFlag still has its partner and nothing can hang.
     const bool keepAqk32Raw = (rawMode & 1) == 0;
     const bool keepLRaw = (rawMode & 2) == 0;
     TPipe pipe;
@@ -541,10 +380,8 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
         WaitFlag<HardEvent::MTE1_M>(e1m);
         // srcStride counts C0 (16-element) units between the n-blocks of one
         // L0C row: at KF = 2 the two n-blocks of a row sit KF * 256 elements
-        // apart, i.e. KF * 16 = M units (probe /tmp/cubeprobe.py STYLE=fract
-        // FXMODE=one FXSTRIDE=32 is exact; M / 16 = 2 is not).  With a
-        // single n-block the field is not read, so the KDA_CHUNK = 16 build
-        // keeps the value it has always shipped.
+        // apart, i.e. KF * 16 = M units.  With a single n-block the field is
+        // not read, so the KDA_CHUNK = 16 build keeps the value unchanged.
         constexpr int32_t FX_SRC_STRIDE = M > 16 ? M : 1;
         auto ip = FixpipeParamsV220(M, M, FX_SRC_STRIDE, M, false);
         ip.quantPre = QuantMode_t::NoQuant;
@@ -625,8 +462,8 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb, GM_ADDR pGx,
     GM_ADDR pAqk32, GM_ADDR pAqk16, GM_ADDR pL, GM_ADDR pMaskS, GM_ADDR pMaskL,
     int32_t B, int32_t T, int32_t H, float lower_bound, float scale, int32_t unroll,
-    // ``debugStores`` stays the trailing int32 on purpose: tests/test_dead_store.py
-    // reads args[-1] as the flag, so the probe-only ``rawMode`` goes in front of it.
+    // ``debugStores`` stays the trailing int32; the diagnostic ``rawMode``
+    // therefore goes in front of it.
     int32_t xRowBytes, int32_t gRowBytes, int32_t rawMode, int32_t debugStores) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     if ASCEND_IS_AIC {
@@ -661,15 +498,9 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // that keeps the next pass's loads off the three landing buffers
     // until this pass's V has read them (see the rv block).
     TEventID em2 = pipe.AllocEventID<HardEvent::V_MTE2>();
-    // R3: the band staging of "post_gram" is a two-deep ring, one queue per
-    // stream (Gram tiles, masks, the fp32 result, the bf16 rounding), so that
-    // the band drain can go (see there).  TQue storage is not merged with the
-    // scratch buffers by the TPipe allocator, which is why the ring has to be
-    // paid for in UB rather than overlaid on dead scratch: at CHUNK = 64 the
-    // four queues are 52 KB against the 18 KB of single-buffered tiles they
-    // replace, and the kernel then has under 8 KB of UB headroom left
-    // (measured with a live dummy buffer; the exact budget depends on the
-    // allocator's per-position slabs, not on the nominal sizes).
+    // `post_gram` uses a two-deep ring per stream (Gram tiles, masks, fp32
+    // result, bf16 rounding).  TPipe does not overlay TQue storage with
+    // scratch buffers, so this ring needs explicit UB.
     TQue<TPosition::VECIN, 2> qgin, qgmk;
     TQue<TPosition::VECOUT, 2> qgout, qgo16;
     TBuf<TPosition::VECCALC> bQf, bKf, bT0, bT2, bEf, bRed,
@@ -697,19 +528,12 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     pipe.InitBuffer(qgmk, 2, 2 * 16 * M * 4);
     pipe.InitBuffer(qgout, 2, 2 * 16 * M * 4);
     pipe.InitBuffer(qgo16, 2, 16 * M * 2);
-    // The select's bit masks are V-only (compare then select, same pipe).  P2-1
-    // hoisted them out of the per-band loop: the two triangular masks are the
-    // same [M, M] tile for every chunk, so the whole chunk's bits (M * M / 8
-    // bytes per mask, plus padding) are built once per block and read back band
-    // by band (see post_gram).  This replaces the per-band bMbits scratch.
+    // The select's bit masks are V-only.  They are invariant across chunks and
+    // are built once per block, then read back band by band by `post_gram`.
     pipe.InitBuffer(bMfull, 2 * M * M / 8 + 64);
-    // Published Gram operands: one pass band's worth of UB per operand.
-    // These used to be a two-deep whole-chunk ring (3 x [M, D] bf16 = 48 KB
-    // at KDA_CHUNK = 64) which, with the whole-chunk staging above, put this
-    // kernel past the 192 KB of UB (measured: the C = 64 build faulted with a
-    // VEC out-of-bounds).  The stores now leave for GM with each pass band,
-    // and the FL_READY handoff below already rides PIPE_MTE3, so the Cube
-    // still only sees a chunk once its last band has drained.
+    // Published Gram operands use one pass band's worth of UB per operand.
+    // Stores leave for GM with each pass band; FL_READY rides PIPE_MTE3, so
+    // the Cube sees a chunk only after its last band has drained.
     TBuf<TPosition::VECCALC> bPga0, bPgk0, bPgb0;
     pipe.InitBuffer(bPga0, NG * 2);
     pipe.InitBuffer(bPgk0, NG * 2);
@@ -761,12 +585,9 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     L.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pL));
     MaskS.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pMaskS));
     MaskL.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pMaskL));
-    // One block walks `unroll` consecutive chunks: the kernel is issue-bound
-    // (~40 cycles per vector instruction) and pays a fixed per-block cost that
-    // is a tenth of a block's work, so amortizing it over 2-8 chunks is worth
-    // 2.68 -> 2.34 ms at [1,8192,32] (unroll 8) with the body unchanged and
-    // bit-identical output.  `api.py` picks the unroll from the chunk count.
-    // In MIX_AIC_1_2 the AIV sees 2N raw blocks for N AIC blocks: the raw index
+    // One block walks `unroll` consecutive chunks; `api.py` picks the count
+    // from the chunk count.  In MIX_AIC_1_2 the AIV sees 2N raw blocks for N
+    // AIC blocks: the raw index
     // picks the group and GetSubBlockIdx() the subcore.  The two subcores walk
     // interleaved chunks (2u + sub) so the paired Cube reads two adjacent
     // operand tiles per step.  Out-of-range chunks clamp to the last one, which
@@ -789,19 +610,17 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     const uint64_t cm = static_cast<uint64_t>(c) * M;
     // The four stage-1 inputs are read straight out of the public [B, T, H, D]
     // layout instead of a packed [c, M, D] copy: one token is D contiguous
-    // elements and consecutive tokens of a chunk sit H*D elements apart, so a
-    // strided DataCopy replaces the pack (which cost a 0.67 ms round trip of
-    // 1.07 GB at [1,8192,32]).  The downstream buffers keep the packed order.
+    // elements and consecutive tokens of a chunk sit H*D elements apart.
+    // The downstream buffers keep the packed order.
     const int32_t b = bh / H;
     const int32_t ck = c - bh * nt;
     const uint64_t xb = (static_cast<uint64_t>(b) * T + static_cast<uint64_t>(ck) * M) *
                             static_cast<uint64_t>(H) * D +
                         static_cast<uint64_t>(head) * D;
 
-    // The block/stride form of DataCopy is broken for a strided GM source on
-    // this part (halves the bursts land unwritten, probe
-    // /tmp/kdaval/probe_stride4.py); DataCopyPad's byte-stride form reads the
-    // same gather correctly, so the four stage-1 inputs use it.
+    // The block/stride form of DataCopy is unreliable for a strided GM source
+    // on this part; DataCopyPad's byte-stride form reads the same gather
+    // correctly, so the four stage-1 inputs use it.
     // ---- full-chunk gate -------------------------------------------------
     // The cumsum runs along the rows, so the whole chunk has to be in one
     // tile; everything else below is row-local and is walked in NP passes of
@@ -811,8 +630,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     DataCopy(alog, Alog[head], 8);
     DataCopy(beta, Beta[cm], DataCopyParams(1, M / 8, 0, 0));
     // One set/one wait: the beta sigmoid below needs the G/log/beta loads in
-    // UB, and the wait is the only consumer of this channel ("e2vs" used to
-    // also carry post_gram's mask loads, which the band queues own now).
+    // UB, and the wait is the only consumer of this channel.
     SetFlag<HardEvent::MTE2_V>(e2vs);
     WaitFlag<HardEvent::MTE2_V>(e2vg);
 
@@ -859,12 +677,9 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Muls(gfs, gfs, lower_bound, NG);
     PipeBarrier<PIPE_V>();
     }
-    // Blocked (radix-8) prefix sum, docs 11.55.  The 63-step serial chain
-    // (Add + PipeBarrier per row, ~0.3 ms of the pre_gram launch at
-    // [1,8192,96,128]) is replaced by three phases whose aliasing read/write
-    // pairs are split across instructions - a naive in-place log-scan reads
-    // rows the same instruction wrote, repeat-level RAW that the hardware
-    // does not order, and comes out NaN:
+    // Blocked radix-8 prefix sum.  Its phases split aliasing read/write pairs
+    // across instructions; a naive in-place log-scan would create repeat-level
+    // RAW that this hardware does not order:
     //   A) per 8-row block, the serial prefix in 7 levels; a level's two
     //      calls write rows {8b+j} and read rows {8b+j-1}, disjoint mod 8;
     //   B) the S block totals (rows 8b+7) scanned serially - 7 dependent
@@ -872,10 +687,8 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     //   C) rows 8b..8b+6 add the previous blocks' cumulative total
     //      (broadcast source, src1RepStride = 0); row 8b+7 already holds it
     //      and is skipped, so no phase-C call reads what phase-C wrote.
-    // Same prefix, different summation order: last-ulp changes (measured at
-    // [1,8192,96,128]: out rel 2.5e-6 / max|d| 3.05e-5 against the gate's
-    // own 8.6e-3 margin, e2e -0.112 ms), so this is a tolerance-gated change
-    // rather than a bit-identical one.
+    // This computes the same prefix in a different summation order, within the
+    // gate tolerance.
     {
         constexpr int32_t BS = 8;         // rows per block
         constexpr int32_t NB = M / BS;    // blocks (8 at CHUNK = 64)
@@ -1045,10 +858,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // later DataCopyPad - the next pass's three loads - until the V queue is
     // past this point.  It has to be a marker and not the MTE3 drain's
     // transitive effect: a WaitFlag on a pipe's event queue does not stall the
-    // scalar unit, so with the drain alone the loads ran a pass ahead and the
-    // rv tile - the late reader of the three - came back holding the next
-    // pass's V (6136/8192 elements wrong at CHUNK = 64, probe /tmp/pgqK.py;
-    // with the marker: bit-exact, and 0.004 ms = noise).
+    // scalar unit, so the marker is required for this late reader.
     SetFlag<HardEvent::V_MTE2>(em2); WaitFlag<HardEvent::V_MTE2>(em2);
 
     // ---- kg = kn * exp2(gate_last - gate) --------------------------------
@@ -1109,14 +919,8 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // drain - V waits until the stores that read those tiles have landed -
     // closes the MTE3-read -> V-write half of the boundary.  The MTE2 half
     // (V-read -> load-write) is a separate pair at the last landing-buffer
-    // read, see the rv block; the three store-only bf16 tiles are what makes
-    // the two halves independent, and the MTE3-read -> MTE2-write path that
-    // needed the PIPE_ALL (probe /tmp/pgq8.py, 13 debug tensors diffed: only
-    // Qn/Kn/Rv moved) no longer exists.  A full PipeBarrier<PIPE_ALL> here is
-    // 0.49 ms of the stage; a loop-carried MTE3->MTE2 / MTE3->V *pair*
-    // instead hangs or traps even when primed (3 attempts, /tmp/pgq5.py +
-    // pgq6.py + pgq7.py).  At KDA_CHUNK = 16 there is one pass and both
-    // branches compile away, as before.
+    // read, see the rv block.  At KDA_CHUNK = 16 there is one pass and both
+    // branches compile away.
     SetFlag<HardEvent::MTE3_V>(e3p); WaitFlag<HardEvent::MTE3_V>(e3p);
 
     // ---- cross-band k side of the (1, 0) Gram block -----------------------
@@ -1173,19 +977,16 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // hangs the long shapes).
     CrossCoreSetFlag<2, PIPE_MTE3>(FL_READY);
     cprev = c;
-    // No PipeBarrier<PIPE_ALL> here any more (0.13 ms).  The chunk boundary is
+    // No PipeBarrier<PIPE_ALL> here.  The chunk boundary is
     // the pass boundary one level up and is covered by the same two pairs: the
     // V->MTE2 marker in the rv block orders the next chunk's three loads after
     // this chunk's last landing-buffer read, and the MTE3->V drain at the end
     // of the pass body orders the next chunk's V writes after the stores that
     // read the tiles they overwrite.  Both are unconditional so that the C=16
     // build - one pass per chunk, where the boundary *is* the chunk boundary -
-    // keeps the same two guarantees.  Measured at CHUNK=64 (probe /tmp/r3a.py,
-    // 3 interleaved rounds x 8 chunks, 25 intermediates diffed): bit-exact,
-    // pre_gram 3.441 -> 3.310 ms.
+    // keeps the same two guarantees.
     }
-    // Drain the pipeline: the last chunk's Gram has no later chunk to hide
-    // behind (~1/unroll of the stage, and the Cube is idle by then).
+    // Drain the pipeline after the final chunk's Gram.
     post_gram(qgin, qgmk, qgout, qgo16, mbitsAll, Aqk32, L, Aqk16,
               MaskS, MaskL, cprev, scale, !masksBuilt, debugStores != 0);
     masksBuilt = true;

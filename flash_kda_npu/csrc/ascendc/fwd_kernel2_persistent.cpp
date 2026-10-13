@@ -1,5 +1,5 @@
-// Persistent K2, CHUNK-generic (R2): one MIX_AIC_1_2 launch runs the whole
-// chunk recurrence on the device instead of eight host launches per chunk.
+// Persistent K2: one MIX_AIC_1_2 launch runs the whole chunk recurrence on
+// the device.
 //
 // Each block owns one or more heads (bh) and every AIV subcore owns one value
 // tile (iv), so a block has nh * 2 independent state tiles in flight and the
@@ -10,16 +10,11 @@
 // protocol is a head, because that is the only split both subcores share).
 // Four flag ids carry the whole loop, the protocol is depth one, and the AIV
 // pre-sets R once per head before the loop so the first chunk needs no special
-// case.  See docs/VLLM_ASCEND_KDA_REVIEW_20260911.md for why that matters.
+// case.
 //
 // The AIV stores `out` straight into the caller's [B, T, H, D] tensor: the M
 // chunk rows of a 64-wide value tile are M separate 128 B runs, NH * D
-// elements apart, which the block form of DataCopy expresses with dstGap.  The
-// api used to write a task-major `out_task` here and follow it with a
-// 67 MB + 67 MB `permute(0, 3, 4, 1, 2, 5).contiguous()` (186 us of device
-// time, measured with msprof); the strided store costs 0.04 ms of K2 and is
-// bit-exact against the old layout plus host permute (checked at
-// [1, 1024, 32] and [1, 8192, 32] against the same kernel writing task-major).
+// elements apart, which the block form of DataCopy expresses with dstGap.
 //
 // The fp32 state never leaves the AIV: it is loaded from H0 at start-up, kept
 // in UB across the whole loop and stored to S32 once at the end.  Only the bf16
@@ -29,11 +24,9 @@
 // *before* the wait: the two MTE2 reads of W/Qg in stage 1, the flag-free Aqk
 // and Kg^T reads in stage 3, U in stage 2 and D2/Decay in stage 4.  The waits
 // they precede only guard the state-dependent tiles (S16, Vt, D1, D3/D4), so
-// the earlier of the two loads is always private to this core.  Hoisting all
-// four stages is worth 3.74 -> 3.44 ms of K2 at [1,8192,32] (3 rounds x 3
-// reps, R=3, medians 3.786 -> 3.460, bit-identical outputs); each hoist on its
-// own only buys 0.05-0.08 ms, so it is the *serialisation* behind the flag
-// that costs, not any single load.  The WAR `PipeBarrier<PIPE_ALL>` of stages 2
+// the earlier of the two loads is always private to this core.  Hoisting those
+// reads lets their latency overlap work that does not depend on the cross-core
+// result.  The WAR `PipeBarrier<PIPE_ALL>` of stages 2
 // and 4 must stay *before* the hoisted load (it orders the previous
 // iteration's vector reads against the UB staging buffers).
 //
@@ -41,67 +34,41 @@
 // AIV widens each tile back with one Cast.  Those three tiles only carry the
 // stage-1/3 Cube results over to the vector side, and both consumers survive
 // the rounding - the state stays fp32 and every accumulation (v_new = u - d1,
-// out = d2 * scale + d3) is still fp32.  Before the change the pass was
-// bit-exact against the separated path; after it the pytest gate reads
-// out_err 1.5e-5 (< 1e-3) and state_err 1.4e-7 (< 1e-4).  K2 at [1,8192,32]
-// goes 3.423 -> 3.326 ms (MIN of 3 rounds x 4 reps in one process, median
-// 3.466 -> 3.352), so the half-width tiles are worth ~3%.
+// out = d2 * scale + d3) is still fp32.
 //
-// R2 (2026-09-14): every tile follows the chunk size.  Through R1 this kernel
-// hard-coded M = 16 (the C=16 chunk) while K1 had long been CHUNK-parameterised,
-// so at KDA_CHUNK = 64 it walked 16-row pieces of 64-row chunks - a quarter of
-// the rows, at the wrong GM offsets, i.e. fast and wrong (plan section 11.5).
-// Here M = KDA_CHUNK, NG = 2 * BV / M and stage 3's contraction dim is the
-// chunk's row count, so the whole kernel is one set of formulas over (M, NG)
-// with no branch on the chunk size.
+// Every tile follows the chunk size.  M = KDA_CHUNK, NG = 2 * BV / M and
+// stage 3's contraction dim is the chunk's row count, so the whole kernel is
+// one set of formulas over (M, NG) with no branch on the chunk size.  The
+// staging budget is what caps the head count: at M = 64 it is 56.5 KB of this
+// part's 192 KB UB, so two heads of 32 KB state fit together with nh = 2.
 //
-// What the chunk size does *not* buy is what the protocol model predicted: this
-// loop turned out to be descriptor/work- rather than flag-bound, so handing the
-// flag chain over four times fewer times (512 -> 128 chunks) only moved K2
-// 6.51 -> 6.04 ms at [1,8192,96,128] (MIN of 4).  The win came from the *tile*
-// a bigger chunk makes affordable: the staging is 112.5 KB of the 192 KB at
-// M = 64, so two heads of 32 KB state still fit, and nh = 2 is what lets the
-// depth-one protocol overlap the two engines the way C=16 does with nh = 4.
-// K2 6.04 -> 3.91 ms, e2e 12.79 -> 10.74 ms, outputs bit-identical (plan
-// section 11.6.2); nh = 1 serialises the engines - see api.py's PERSIST_MAXH.
-//
-// R3 (2026-09-14): the [BV, M] v_new^T tile is stored *once*, in the block order
-// the d4 A operand reads - packed, contiguous, one call - and the d34 B
-// operand's order (the same 16 x 16 blocks, block-transposed) is built by its
-// load with explicit strides.  The two L0 walks really do differ: the A operand
-// walks R / 16 bands row-block-major, while a `dstNzC0Stride = R` Nd2Nz packs
-// the source C0 blocks column-block-major, which is the B operand's order.  The
-// three variants were measured separately (plan section 11.11): the packed
-// store alone leaves `out` wrong and the state exact (d4's operands are this
-// tile and kg^T, so only the B-operand path moves `out`), the two plain reads
-// leave `out` right up to that block order and the state wrong, and only the
-// pair is bit-exact (out and state rel 0.000e+00, K2 3.696 -> 2.457 ms at
-// [1,8192,96,128]).
+// The [BV, M] v_new^T tile is stored *once*, in the block order the d4 A
+// operand reads - packed, contiguous, one call - and the d34 B operand's order
+// (the same 16 x 16 blocks, block-transposed) is built by its load with
+// explicit strides.  The A operand walks R / 16 bands row-block-major, while a
+// `dstNzC0Stride = R` Nd2Nz packs the source C0 blocks column-block-major,
+// which is the B operand's order.
 //
 // The 16-row fractal stays the unit of every L0 load, and the three operand
-// layouts this kernel needs are all built from the two idioms the C=16 kernel
-// already used, each one verified on hardware:
+// layouts this kernel needs are all built from the two idioms below:
 //   * L0A [R, C] (W/Qg, Aqk, v_new^T as the d4 A operand): R / 16 bands, each
 //     `Nd2NzParams(1, 16, C, 0, C, 16, 1, 0)` - dstNzC0Stride = R = 16 = one
-//     band - then one `LoadData2dParams(0, C / 16, 1, 0, 0, false, 0)`.  At
-//     R = 16 this is the single call the C=16 kernel shipped.  v_new^T is
-//     now *stored* in that band order (R3), so the read is one plain burst.
+//     band - then one `LoadData2dParams(0, C / 16, 1, 0, 0, false, 0)`.
+//     v_new^T is stored in that band order, so the read is one plain burst.
 //   * L0B [C, R] whose source has the rows on the n dim (S16, v_new^T):
 //     `Nd2NzParams(1, R, C, 0, C, R, 1, 0)`, one call, then
 //     `LoadData2dParams(0, R * C / 256, 1, 0, 0, false, 0)`.  dstNzC0Stride =
 //     R packs the source C0 blocks column-block-major, which *is* the L0B
-//     fractal order (the 16-row and 64-row forms of this call are the shipped
+//     fractal order (the 16-row and 64-row forms of this call are the production
 //     S16 and v_new loads).
 //   * L0B [C, R] whose source has the rows on the *k* dim (kg, which the api
 //     hands over in its public [c, CHUNK, D] layout): the same band loop as an
 //     L0A, then `LoadDataWithTranspose` per band, whose destination fractals
 //     are consecutive.  The band's fractals land at band * (R / 16), which is
 //     the L0B k-block order.
-// A chunk-sized tile therefore costs 4 small calls where the C=16 tile cost 1,
-// but four times fewer chunks.  That descriptor count (~640 per chunk-head on
-// the AIC side) is where the remaining 3.9 ms of K2 is thought to sit and is
-// the next lever (plan section 11.6.5); the C=16 path keeps a plain-burst
-// shortcut, see the `K == FR` branches in stage 3.
+// A chunk-sized tile therefore costs 4 small calls but covers four times
+// fewer chunks.  The C=16 path keeps a plain-burst shortcut, see the
+// `K == FR` branches in stage 3.
 #include "kernel_operator.h"
 using namespace AscendC;
 
@@ -254,16 +221,11 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 qs.FreeTensor(ls);
                 // L0A/L0B/L0C are reused by the next stage on this same core.
                 // The FIX_M event above only covers L0C; the L0A/L0B WAR is an
-                // Mmad-read vs LoadData-write hazard, so what this needs is an
-                // M -> MTE1 order, not a full drain.  PipeBarrier<PIPE_M> is
-                // *not* that order (it only orders M against M, so the next
-                // LoadData still overwrites L0B under the Mmad) and it faults
-                // this kernel with an aicore exception (MTE/FIXP 0x363c,
-                // CUBE_ERR 0xaf0200ab) about one launch in ten at [1,8192,32]
-                // and one in three at [1,8192,96].  The M_MTE1 event pair is
-                // the actual order and is bit-identical: 6.474 -> 6.383 ms at
-                // [1,8192,96,128] (MIN of 2, same process) with sum 25424.465
-                // unchanged.
+                // Mmad-read vs LoadData-write hazard, so this needs an
+                // M -> MTE1 order, not a full drain.  PipeBarrier<PIPE_M> only
+                // orders M against M, so it does not keep the next LoadData
+                // from overwriting L0B under the Mmad.  The M_MTE1 event pair
+                // is the actual required order.
                 SetFlag<HardEvent::M_MTE1>(em1);
                 WaitFlag<HardEvent::M_MTE1>(em1);
                 CrossCoreSetFlag<2, PIPE_FIX>(FL_C1);
@@ -278,11 +240,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 auto lk = qk.AllocTensor<bfloat16_t>();
                 if (K == FR) {
                     // One C0 block per row: the ND tile already *is* the
-                    // fractal order, so one plain burst loads it - the form
-                    // the C=16 kernel shipped.  The per-band Nd2Nz below is
-                    // the general case and costs a descriptor per row (16 per
-                    // band against ~2 for the whole tile), which at C=16 is
-                    // worth 15.6 -> 6.x ms of K2 all by itself.
+                    // fractal order, so one plain burst loads it.
                     DataCopy(la, Aqk[static_cast<uint64_t>(c) * M * K], M * K);
                 } else {
                     for (int32_t b = 0; b < NB; ++b) {
@@ -309,11 +267,11 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                         DataCopy(lv[iv * BV * K], Vt[t0], BV * K);
                         DataCopy(lx[iv * BV * K], Vt[t0], BV * K);
                     } else {
-                        // R3: the GM tile is in the A operand's block order
-                        // (one plain burst) and the B operand's is its block
+                        // The GM tile is in the A operand's block order (one
+                        // plain burst), and the B operand's is its block
                         // transpose, done here with explicit block strides
                         // instead of an Nd2Nz that re-packs the row-major
-                        // tile.  See the stage-2 store and plan section 11.11.
+                        // tile.  See the stage-2 store.
                         // The B operand's [K, N] fractal order is row-major
                         // like the A operand's [M, K]: k band major, value
                         // band minor, inner stride BV / FR.  So Vt's block
@@ -321,10 +279,8 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                         // walk is over the chunk's K / FR k bands with BV / FR
                         // bursts each, and *not* over BV / FR groups with a
                         // BV / FR source stride.  C=16 (NB = 1) and C=64
-                        // (K = BV = 64) cannot tell those two apart, which is
-                        // how the wrong one shipped; C=32 can, and did: there
-                        // it wrote 8 KB into a 4 KB slot and ran 4 KB past qx
-                        // (plan section 11.24).
+                        // (K = BV = 64) cannot tell those two apart; C=32
+                        // can, and confusing them writes outside the qx slot.
                         DataCopy(lv[iv * BV * K], Vt[t0], BV * K);
                         for (int32_t c = 0; c < K / FR; ++c) {
                             DataCopy(lx[iv * BV * K + c * (BV / FR) * FR * FR],
@@ -369,12 +325,10 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 WaitFlag<HardEvent::MTE1_M>(e1m);
                 // L0C, L0A and L0B are free again once the d12 fixpipes
                 // retired (stage 1 ends with an FIX_M wait and a barrier).
-                // One 128 x 128 Mmad and one Fixpipe write the whole d4 tile:
-                // a single Mmad leaves L0C as one contiguous run of 16 x 16 C0
-                // fractals - the walk srcStride = mSize describes - while the
-                // eight 16-row Mmads of the old form wrote one m-major band
-                // per group that no srcStride can read back.  Bit-exact
-                // against the eight-call form (hardware probe + full pass).
+                // One 128 x 128 Mmad and one Fixpipe write the whole d4 tile.
+                // A single Mmad leaves L0C as one contiguous run of 16 x 16
+                // C0 fractals, which is the layout the row-major Fixpipe walk
+                // with srcStride = mSize reads.
                 Mmad(cf, l0a, l0b, MmadParams(NG * M, N_D4, K, 0, false, true));
                 for (int32_t iv = 0; iv < nv; ++iv) {
                     Mmad(cf[NG * M * N_D4 + iv * M * N], l0a[NG * M * K],
@@ -449,7 +403,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         TEventID e3v = pipe.AllocEventID<HardEvent::MTE3_V>();
         // UB budget.  The fp32 state is 32 KB per head and all MAXH of them
         // stay resident for the whole loop, so the staging has to fit in the
-        // rest of this part's 192 KB UB.  R3: the staging is *aliased by
+        // rest of this part's 192 KB UB.  The staging is *aliased by
         // phase* - stage 2 and stage 4 never overlap (each stage opens with a
         // PipeBarrier<PIPE_ALL>, which is exactly the drain that makes the
         // reuse safe), so one set of buffers carries both:
@@ -460,15 +414,12 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         //   D  TILE bf16     : vb (2)   | d4's 16-row quarter (4)
         // B/D are sized max(TILE, S_TILE / 2) bytes because at C = 16 the
         // bf16 state half (8 KB) is four times a 16-row tile (2 KB).
-        // Aliasing *within* stage 4 is safe for the same reason the original
+        // Aliasing *within* stage 4 is safe because
         // ob -> d1 and of -> vf aliases were: the vector pipe is in order, so
         // d3 is consumed by its Cast before ob is written into the same bytes,
         // and d2 by its Cast before s16 does.
-        // The old layout cost TILE * 4 (fp32 widening) + 2 * TILE * 4 (vf/of
-        // and the d1/d2/d3 widening) + 5 * TILE * 2 + 2 * TILE * 2 (sc, vt) +
-        // (S_TILE / 2) * 4 (d4) + (S_TILE / 2) * 2 (s16) = 112.5 KB at C = 64,
-        // which is what capped MAXH at 2 there (2 * 32 + 112.5 = 176.5 KB of
-        // 192).  This one is 56.5 KB, so MAXH = 4 fits: 128 + 56.5 = 184.5 KB.
+        // The aliased layout needs 56.5 KB at C = 64, so MAXH = 4 fits:
+        // 128 + 56.5 = 184.5 KB of 192.
         constexpr int32_t HALF_BYTES = (TILE > S_TILE / 2) ? TILE * 2 : S_TILE;
         TBuf<TPosition::VECCALC> uA, uB, uC, uD, uE, udec, us;
         pipe.InitBuffer(uA, TILE * sizeof(float));
@@ -517,9 +468,8 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
             // (exactly the hazard the in-loop publish guards the same way).
             for (int32_t hf = 0; hf < 2; ++hf) {
                 // NB: PipeBarrier<PIPE_MTE3> does NOT order a later V-pipe
-                // Cast after an MTE3 read of the same buffer (measured: the
-                // snapshot comes out wrong and out_err jumps 7.6e-06 ->
-                // 2.9e-03 at [1,16,2]).  A global barrier does.
+                // Cast after an MTE3 read of the same buffer.  A global
+                // barrier does.
                 if (hf == 1) PipeBarrier<PIPE_ALL>();
                 LocalTensor<float> sh = state[hf * (S_TILE / 2)];
                 Cast(s16, sh, RoundMode::CAST_RINT, S_TILE / 2);
@@ -590,26 +540,13 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 WaitFlag<HardEvent::V_MTE3>(ev3);
                 if (pVnew != nullptr) DataCopy(V[out0], vb, DataCopyParams(M, BV / 16, 0, 0));
                 // `V` is the row-major twin of the packed `Vt` below, and
-                // nothing in this kernel reads it: the AIC takes every
-                // operand from `Vt` (stages 1/3) so the only consumer is
-                // the host, under return_intermediates.  Guarding it saves
-                // 0.095 ms of K2 at [1,8192,96,128] (interleaved A/B,
-                // MIN of 11: 4.096 -> 3.983) and is bit-exact by
-                // construction - see the pQn/pKn pattern in k1_pre_gram_mix.
-                // The 16 transposes above leave the [BV, M] tile in *packed*
-                // 16 x 16 block order - the blocks are contiguous, in the
-                // (j, m) band order the gather used, which is exactly the A
-                // operand's band walk and *not* the row-major [BV, M] tile.
-                // R3: one call for the packed order, and the B operand's
-                // block transpose is done on the MTE2 side (see stage 3) -
-                // 0.82 ms of store plus ~0.4 ms of the two Nd2Nz reads, which
-                // re-packed this same tile, for 3.696 -> 2.457 ms at
-                // [1,8192,96,128] with out and state bit-identical.  The form
-                // this replaces scattered each block into its row-major slot:
-                // one call per block, FR bursts of one 16-element row, M / 16
-                // blocks apart - the stage-4 out store's gap form, but 16x the
-                // descriptors.  At M = FR that loop was already contiguous and
-                // this call is bit-identical to it (verified at C=16).
+                // nothing in this kernel reads it: the AIC takes every operand
+                // from `Vt`, so the only consumer is the host under
+                // return_intermediates.  The transposes above leave the
+                // [BV, M] tile in packed 16 x 16 block order, exactly the A
+                // operand's band walk rather than a row-major tile.  Vt gets
+                // that packed order in one call; the B operand's block
+                // transpose is done on the MTE2 side in stage 3.
                 DataCopy(Vt[out0], vt, BV * M);
                 CrossCoreSetFlag<2, PIPE_MTE3>(FL_V);
             }
@@ -641,8 +578,8 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 Add(of, of, d3f, TILE);
                 Cast(ob, of, RoundMode::CAST_RINT, TILE);
                 PipeBarrier<PIPE_V>();
-                // The state recurrence walks the tile in four 16-row quarters
-                // (R3): a quarter of the bf16 staging (S_TILE / 4) is what
+                // The state recurrence walks the tile in four 16-row quarters:
+                // a quarter of the bf16 staging (S_TILE / 4) is what
                 // lets the d4 tile share the stage-2 v_new buffer, and 16 rows
                 // is the smallest slice the 16-block repeat stride still walks
                 // as whole rows.  Each next quarter's load and its MTE2->V
@@ -655,9 +592,8 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                         // s16 before this quarter's Cast rewrites it.  That is
                         // an MTE3 -> V dependency across pipes, which a
                         // PipeBarrier<PIPE_MTE3> does NOT provide (it only
-                        // orders MTE3 against MTE3 - measured on the start-up
-                        // publish: the snapshot came out wrong and out_err
-                        // went 7.6e-06 -> 2.9e-03), so it needs the event pair.
+                        // orders MTE3 against MTE3), so it needs the event
+                        // pair.
                         WaitFlag<HardEvent::MTE3_V>(e3v);
                     }
                     LocalTensor<float> sh = state[hf * (S_TILE / 4)];
@@ -672,8 +608,6 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                     if (hf == 0) {
                         // [b, t, h, D] directly: one 4-block (128 B) run per
                         // chunk row, the next row NH * D elements further on.
-                        // Saves the 186 us Transpose that used to turn the task
-                        // layout around.
                         const int32_t hh = bh - (bh / NH) * NH;
                         const uint64_t obase = (static_cast<uint64_t>(bh / NH) * NT + chunk) *
                                                    (static_cast<uint64_t>(M) * NH * D) +
