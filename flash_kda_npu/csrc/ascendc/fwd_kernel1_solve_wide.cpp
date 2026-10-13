@@ -67,18 +67,7 @@ constexpr int32_t NCH = NC / SB;             // chunks per block
 constexpr int32_t RW = NC * M;    // floats in one row of the tile / of lraw
 constexpr int32_t CH = NC * MM;   // floats in one block's A_inv
 constexpr int32_t CM = 64 * 255;  // largest count-mode calCount
-#if KDA_SOLVE_WIDE_SUBB == 4
-// The SB = 4 coupling export: the six strictly-lower 16-blocks of every chunk
-// in one contiguous per-chunk bundle, negated for the Cube.  Layout per chunk:
-//   [ (1,0) 256 | (3,2) 256 | rows 32..63 x cols 0..31  1024 ]  = 1536 bf16
-// The first two are the 16-level couplings, the 32x32 tail is exactly the
-// [2,0|2,1 ; 3,0|3,1] rectangle the assemble's second-level products consume
-// (k1_solve_assemble4.cpp); at SB = 2 the bundle is the single lower-left
-// block (M^2 = 1024 at M = 32), i.e. this constant generalises that export.
-constexpr int32_t CE = 6 * MM;
-#else
-constexpr int32_t CE = MM;        // SB <= 2: one [M, M] block per chunk
-#endif
+constexpr int32_t CE = MM;        // one [M, M] block per chunk
 // The L21 tile is [chunk][row][lane]: one contiguous [M, M] block per chunk,
 // which is exactly how the Lneg export is laid out in GM.  The per-chunk
 // stride is MM and the tile totals NCH * MM elements.
@@ -164,25 +153,9 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
     // its operand.  One 2D copy per chunk: the M rows of that chunk's [M, M]
     // lower-left block (row stride PC) land contiguous, ready for the store.
     for (int32_t ch = 0; ch < NCH; ++ch) {
-#if KDA_SOLVE_WIDE_SUBB == 4
-        // Three gathers into the chunk's 1536-element slot: the two 16-level
-        // couplings and the 32x32 rectangle.  Each is a straight run of rows
-        // (row stride PC) so the destination is the contiguous bundle.
-        const uint64_t base = static_cast<uint64_t>(c0 + ch) * PC * PC;
-        DataCopy(l21f[ch * CE + 0 * MM],
-                 L[base + M * PC],
-                 DataCopyParams(M, M / 8, (PC - M) / 8, 0));
-        DataCopy(l21f[ch * CE + 1 * MM],
-                 L[base + 3 * M * PC + 2 * M],
-                 DataCopyParams(M, M / 8, (PC - M) / 8, 0));
-        DataCopy(l21f[ch * CE + 2 * MM],
-                 L[base + 2 * M * PC],
-                 DataCopyParams(2 * M, (2 * M) / 8, (PC - 2 * M) / 8, 0));
-#else
         DataCopy(l21f[ch * MM],
                  L[static_cast<uint64_t>(c0 + ch) * PC * PC + M * PC],
                  DataCopyParams(M, M / 8, (PC - M) / 8, 0));
-#endif
     }
 #endif
     SetFlag<HardEvent::MTE2_V>(e2v);

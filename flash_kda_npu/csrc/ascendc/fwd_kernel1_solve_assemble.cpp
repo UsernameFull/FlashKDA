@@ -38,7 +38,6 @@ constexpr int32_t M = PC / 2;      // diagonal sub-block size
 constexpr int32_t MM = M * M;
 constexpr int32_t KF = M / 16;     // 16-row fractal bands
 constexpr int32_t BANDE = KF * 256;  // elements of one [16, M] band (512 at M=32)
-constexpr int32_t BAND = BANDE * 2;  // bytes of one band (1 KB at M=32)
 #ifndef KDA_ASM_NCHUNK
 #define KDA_ASM_NCHUNK 4
 #endif
