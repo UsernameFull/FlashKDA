@@ -19,7 +19,7 @@ lib = str(home / arch / 'lib64')
 
 name = os.environ.get('LAUNCHER_NAME', 'kda_bt16_launcher')
 kwargs = {}
-if name == 'kda_ascendc_v1_launcher':
+if name == 'flash_kda_npu_launcher':
     build_dir = Path.cwd().parents[1] / 'build/S02_clean/torch_extensions' / name
     build_dir.mkdir(parents=True, exist_ok=True)
     kwargs['build_directory'] = str(build_dir)

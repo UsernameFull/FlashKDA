@@ -229,7 +229,7 @@ def _run_ascendc(
     initial_state: Optional[torch.Tensor],
     final_state: Optional[torch.Tensor],
 ) -> None:
-    from ..kda_ascendc_v1.api import kda_bt16_fwd_ascendc
+    from .ascendc import kda_bt16_fwd_ascendc
 
     state_output = (
         final_state.contiguous() if final_state is not None else None

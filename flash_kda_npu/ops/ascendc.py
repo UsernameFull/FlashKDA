@@ -11,14 +11,14 @@ from typing import Any
 import torch
 import torch_npu
 
-from .layout import pack_tokens
+from .ascendc_layout import pack_tokens
 
 ROOT = Path(__file__).resolve().parents[2]
-EXT = ROOT / "build/S02_clean/torch_extensions/kda_ascendc_v1_launcher"
+EXT = ROOT / "build/S02_clean/torch_extensions/flash_kda_npu_launcher"
 import sys
 if str(EXT) not in sys.path:
     sys.path.insert(0, str(EXT))
-from kda_ascendc_v1_launcher import launch_argsarray_engine, rtc_compile
+from flash_kda_npu_launcher import launch_argsarray_engine, rtc_compile
 
 # Chunk size of the whole pipeline.  It has to match the kernels' KDA_CHUNK
 # (see _defines below): the AIV/Cube block sizes, the triangular masks and the

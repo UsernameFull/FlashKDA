@@ -3,7 +3,7 @@
 This directory adds the Ascend NPU implementation for FlashKDA.  The native
 path uses the AscendC v1 backend ported from the `kda-ascendc` release: the
 host launcher exposes RTC compilation/launch APIs and
-`flash_kda_npu/kda_ascendc_v1/api.py` orchestrates the three production
+`flash_kda_npu/ops/ascendc.py` orchestrates the three production
 stages (`pre_gram`, `solve`, and persistent-loop `k2`).
 
 ## Layout
@@ -20,10 +20,9 @@ flash_kda_npu/
 |       |-- fwd_kernel1_solve_assemble.cpp
 |       |-- fwd_kernel1_solve_cube.cpp
 |       `-- fwd_kernel2_persistent.cpp
-|-- kda_ascendc_v1/
-|   |-- api.py
-|   `-- layout.py
 `-- ops/
+    |-- ascendc.py
+    |-- ascendc_layout.py
     `-- kda_fwd.py
 ```
 
@@ -33,7 +32,7 @@ On an Ascend host with CANN configured:
 
 ```bash
 source /usr/local/Ascend/cann-9.1.0/set_env.sh
-export LAUNCHER_NAME=kda_ascendc_v1_launcher
+export LAUNCHER_NAME=flash_kda_npu_launcher
 bash flash_kda_npu/csrc/build_launcher.sh
 ```
 

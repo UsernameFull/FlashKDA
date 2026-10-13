@@ -18,7 +18,7 @@ def build_npu_extension() -> None:
         return
     script = os.path.join(this_dir, "flash_kda_npu", "csrc", "build_launcher.sh")
     env = os.environ.copy()
-    env.setdefault("LAUNCHER_NAME", "kda_ascendc_v1_launcher")
+    env.setdefault("LAUNCHER_NAME", "flash_kda_npu_launcher")
     subprocess.run(
         ["bash", script],
         check=True,
@@ -122,8 +122,7 @@ setup(
     version='0.0.1' + rev,
     description='FlashKDA: Flash Kimi Delta Attention',
     ext_modules=ext_modules,
-    packages=['flash_kda', 'flash_kda_npu', 'flash_kda_npu.ops',
-              'flash_kda_npu.kda_ascendc_v1'],
+    packages=['flash_kda', 'flash_kda_npu', 'flash_kda_npu.ops'],
     package_data={
         'flash_kda_npu': [
             'README.md',

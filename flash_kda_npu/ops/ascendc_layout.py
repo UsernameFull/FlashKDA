@@ -3,7 +3,7 @@
 Every K1/K2 kernel addresses the sequence in chunk-major order: the leading
 index ``c`` runs over ``(batch, head, chunk)`` as
 ``c = (b * H + h) * NT + chunk``, matching the ``beta`` packing in
-``kda_ascendc_v1.api``.  ``pack_tokens`` converts the public
+``flash_kda_npu.ops.ascendc``.  ``pack_tokens`` converts the public
 ``[B, T, H, D]`` layout into that form so callers can allocate matching
 output buffers.
 """
