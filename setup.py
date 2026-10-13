@@ -1,10 +1,39 @@
 import os
 import subprocess
+from typing import Optional
 from setuptools import setup
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension, CUDA_HOME
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 subprocess.run(["git", "submodule", "update", "--init", "cutlass"])
+
+
+def ascend_home() -> Optional[str]:
+    return os.getenv("ASCEND_HOME_PATH")
+
+
+def build_npu_extension() -> None:
+    home = ascend_home()
+    if not home:
+        return
+    build_dir = os.path.join(this_dir, "build", "flash_kda_npu-cmake")
+    cmake_args = [
+        "-S",
+        os.path.join(this_dir, "flash_kda_npu", "csrc"),
+        "-B",
+        build_dir,
+        "-DCMAKE_BUILD_TYPE=Release",
+        f"-DASCEND_HOME_PATH={home}",
+    ]
+    subprocess.run(["cmake", *cmake_args], check=True)
+    subprocess.run(
+        ["cmake", "--build", build_dir, "--config", "Release", "--parallel"],
+        check=True,
+    )
+    subprocess.run(
+        ["cmake", "--install", build_dir, "--prefix", this_dir],
+        check=True,
+    )
 
 
 def is_flag_set(flag: str) -> bool:
@@ -52,8 +81,12 @@ def get_arch_flags():
     return flags
 
 
-ext_modules = [
-    CUDAExtension(
+build_npu_extension()
+
+ext_modules = []
+if CUDA_HOME is not None:
+    ext_modules.append(
+        CUDAExtension(
         name='flash_kda_C',
         sources=[
             'csrc/flash_kda.cpp',
@@ -82,8 +115,8 @@ ext_modules = [
                 *get_arch_flags(),
             ],
         },
+        )
     )
-]
 cmdclass = {"build_ext": BuildExtension}
 
 rev = os.getenv("FLASH_KDA_VERSION_SUFFIX", "")
@@ -99,7 +132,11 @@ setup(
     version='0.0.1' + rev,
     description='FlashKDA: Flash Kimi Delta Attention',
     ext_modules=ext_modules,
-    packages=['flash_kda'],
+    packages=['flash_kda', 'flash_kda_npu', 'flash_kda_npu.ops',
+              'flash_kda_npu.cpp_extension_asc'],
+    package_data={
+        'flash_kda_npu.cpp_extension_asc': ['lib/**/*.so', 'lib/**/*.dll'],
+    },
     cmdclass=cmdclass,
     zip_safe=False,
 )
