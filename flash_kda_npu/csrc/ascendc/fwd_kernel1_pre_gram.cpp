@@ -66,10 +66,6 @@ constexpr float EPS = 1e-6f;
 // otherwise a subcore that runs a step ahead donates its next set to the
 // current wait, the pairing drifts one step per chunk and the long shapes hang
 // (which is what the original version did).
-// A mode-2 AIV->AIC flag fires only when *both* subcores of the group have set
-// it (a per-subcore channel can never be satisfied by one producer alone, and
-// the flag is a level rather than a count), so the handshake uses one shared
-// channel per step with both subcores setting it, and the AIC waits it once.
 constexpr uint16_t FL_READY = 8;    // both AIVs -> AIC: step u's operands are in GM
 constexpr uint16_t FL_DONE = 9;     // AIC -> both AIVs: step u's raw Gram is in GM
 
@@ -232,11 +228,6 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
     L.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pL));
 
     for (int32_t u = 0; u < unroll; ++u) {
-        // One wait per AIV channel: neither wait can be satisfied by the
-        // other AIV.  The handshake stays strictly paired (backlog <= 1)
-        // because the AIV that is about to publish step u+1 must first pass
-        // the FL_DONE of step u's Gram, which this AIC can only send after it
-        // has consumed that AIV's step-u flag.
         // One shared channel: both AIV subcores set it once per step, and a
         // mode-2 AIV->AIC flag only fires when *both* of them have (see the
         // header note), so this is the only channel that can carry a step.
@@ -621,7 +612,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // The block/stride form of DataCopy is unreliable for a strided GM source
     // on this part; DataCopyPad's byte-stride form reads the same gather
     // correctly, so the four stage-1 inputs use it.
-    // ---- full-chunk gate -------------------------------------------------
     // The cumsum runs along the rows, so the whole chunk has to be in one
     // tile; everything else below is row-local and is walked in NP passes of
     // MT rows, which is what keeps the staging at its KDA_CHUNK = 16 size.
@@ -634,7 +624,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     SetFlag<HardEvent::MTE2_V>(e2vs);
     WaitFlag<HardEvent::MTE2_V>(e2vg);
 
-    // ---- beta sigmoid ----------------------------------------------------
     WaitFlag<HardEvent::MTE2_V>(e2vs);
     Muls(beta, beta, -1.0f, M);
     Exp(beta, beta, M);
@@ -643,13 +632,9 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     PipeBarrier<PIPE_V>();
     Div(beta, red, beta, M);
     PipeBarrier<PIPE_V>();
-    // ---- beta broadcast over the D axis ----------------------------------
-    // Brcb leaves row k's beta at bb[8 * k] (one 32 B block apart), which is
-    // the stride the beta products below read with srcRepStride = 1.
     Brcb(bb, beta, M / 8, BrcbRepeatParams(1, 8));
     PipeBarrier<PIPE_V>();
 
-    // ---- gate (cumsum carried in the log2 domain) ------------------------
     if (pBias != nullptr) {
         DataCopy(bias, Bias[head * D], DataCopyParams(1, 16, 0, 0));
         SetFlag<HardEvent::MTE2_V>(e2v);
@@ -722,7 +707,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
         PipeBarrier<PIPE_ALL>();
     }
 
-    // ---- decay = exp2(gate_last) ----------------------------------------
+    // decay = exp2(gate_last)
     Muls(t2, gf[(M - 1) * D], LN2, D);
     Exp(t2, t2, D);
     SetFlag<HardEvent::V_MTE3>(ev3);
@@ -744,7 +729,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     LocalTensor<bfloat16_t> pgb = bPgb0.Get<bfloat16_t>();
 
     WaitFlag<HardEvent::MTE3_V>(e3d);
-    // ---- the row-local rest of the chunk, NP passes of MT rows -----------
     for (int32_t hp = 0; hp < NP; ++hp) {
     const int32_t gh = hp * NG;                              // pass offset in UB
     const uint64_t xh = x0 + gh;                             // ... and in GM
@@ -761,7 +745,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Cast(qf, qnb, RoundMode::CAST_NONE, NG);
     PipeBarrier<PIPE_V>();
 
-    // ---- q l2 norm -------------------------------------------------------
     Mul(t2, qf, qf, NG);
     PipeBarrier<PIPE_V>();
     RowReduce(red, ef, t2);
@@ -778,7 +761,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Cast(qf, qnb2, RoundMode::CAST_NONE, NG);
     PipeBarrier<PIPE_V>();
 
-    // ---- k l2 norm -------------------------------------------------------
     WaitFlag<HardEvent::MTE2_V>(e2vk);
     Cast(kf, knb, RoundMode::CAST_NONE, NG);
     PipeBarrier<PIPE_V>();
@@ -798,7 +780,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Cast(kf, knb2, RoundMode::CAST_NONE, NG);
     PipeBarrier<PIPE_V>();
 
-    // ---- gc = gate - gate[the pass's band reference] ---------------------
     // The reference is the middle row of the pass's *gate band* (M/2 at a
     // single band, 16 / 48 at CHUNK = 64): the exponents below are the only
     // place the gate's absolute size enters, and a band-wide reference is what
@@ -823,18 +804,17 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
         PipeBarrier<PIPE_ALL>();
     }
 
-    // ---- exp2(gate) ------------------------------------------------------
     Muls(ef, gfp, LN2, NG);
     Exp(ef, ef, NG);
     PipeBarrier<PIPE_V>();
 
-    // ---- qg = qn * exp2(gate) --------------------------------------------
+    // qg = qn * exp2(gate)
     Mul(t2, qf, ef, NG);
     PipeBarrier<PIPE_V>();
     Cast(qgb, t2, RoundMode::CAST_RINT, NG);
     PipeBarrier<PIPE_V>();
 
-    // ---- rk = kn * beta * exp2(gate) -------------------------------------
+    // rk = kn * beta * exp2(gate)
     Mul(t2, kf, ef, NG);
     PipeBarrier<PIPE_V>();
     Mul(t2, t2, bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
@@ -843,7 +823,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Cast(rkb, t2, RoundMode::CAST_RINT, NG);
     PipeBarrier<PIPE_V>();
 
-    // ---- rv = v * beta ---------------------------------------------------
+    // rv = v * beta
     WaitFlag<HardEvent::MTE2_V>(e2vv);
     Cast(t2, rvb, RoundMode::CAST_NONE, NG);
     PipeBarrier<PIPE_V>();
@@ -861,7 +841,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // scalar unit, so the marker is required for this late reader.
     SetFlag<HardEvent::V_MTE2>(em2); WaitFlag<HardEvent::V_MTE2>(em2);
 
-    // ---- kg = kn * exp2(gate_last - gate) --------------------------------
+    // kg = kn * exp2(gate_last - gate)
     Sub(t2, gf[(M - 1) * D], gfp, 64, MT, BinaryRepeatParams(1, 1, 1, 16, 0, 16));
     Sub(t2[64], gf[(M - 1) * D + 64], gfp[64], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 0, 16));
     PipeBarrier<PIPE_V>();
@@ -883,7 +863,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     if (pQn != nullptr) DataCopy(Qn[xh], qnb2, DataCopyParams(MT, 8, 0, 0));
     if (pKn != nullptr) DataCopy(Kn[xh], knb2, DataCopyParams(MT, 8, 0, 0));
 
-    // ---- Gram half: bf16 operands for the paired Cube ---------------------
     // Each pass casts its own MT rows and stores them straight to GM, so the
     // operands never need a whole-chunk UB ring (see the buffer note).
     // Neither the product scratch nor the second exponential needs a tile of
@@ -923,7 +902,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // branches compile away.
     SetFlag<HardEvent::MTE3_V>(e3p); WaitFlag<HardEvent::MTE3_V>(e3p);
 
-    // ---- cross-band k side of the (1, 0) Gram block -----------------------
     // Band 0's rows are read against band 1's q rows, whose exponents are
     // referenced to band 1's centre (the mid above); a Gram block is only
     // what it should be if both of its operands carry the *same* reference
@@ -953,23 +931,16 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
         // "rvbo" carries the next pass's rv cast, and the pass-boundary
         // drain above sits *before* this store, so this WAR needs a pair of
         // its own: without it the next pass's V write can land in the tile
-        // before this MTE3 read has taken it.  Measured before the pair was
-        // added: the published tile came back 2.7e-1 wide instead of 8.8e-5
-        // (rows 0..23 holding the next band's v * beta), the (1, 0) Gram
-        // block and the solve's L with it, and the whole pipeline's output
-        // at 1.2e+3 relative instead of 5.5e-3 - on one launch layout and
-        // not on another, which is what a landing-buffer race looks like.
+        // before this MTE3 read has taken it.
         SetFlag<HardEvent::MTE3_V>(e3x);
         WaitFlag<HardEvent::MTE3_V>(e3x);
     }
     }
-    // ---- previous chunk's Gram: mask, scale, round, store -----------------
     if (cprev >= 0) {
         post_gram(qgin, qgmk, qgout, qgo16, mbitsAll, Aqk32, L, Aqk16,
                   MaskS, MaskL, cprev, scale, !masksBuilt, debugStores != 0);
         masksBuilt = true;
     }
-    // ---- publish + hand off ---------------------------------------------
     // The publish sits *after* the previous step's DONE wait so that at most
     // one publication per subcore is outstanding: the flag is a level, not a
     // count, so a subcore that runs a step ahead would otherwise donate its

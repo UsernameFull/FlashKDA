@@ -36,8 +36,6 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
     const int32_t c0 = GetBlockIdx() * NC;
     if (c0 >= C) return;
     const int32_t nch = ((C - c0) < NC) ? (C - c0) : NC;
-    // a16Mode 0 re-reads A16 once per pass; 1 keeps the block's NC tiles in L1
-    // for both passes.
     const bool a16res = (a16Mode != 0);
     TPipe pipe;
     TEventID e21 = pipe.AllocEventID<HardEvent::MTE2_MTE1>();
@@ -65,7 +63,6 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
     U.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pU));
 
     if (a16res) {
-    // Read the block's A16 once for both passes.
         for (int32_t ch = 0; ch < nch; ++ch) {
 #if KDA_CHUNK > 16
             DataCopy(a16l1[ch * M * K], A16[static_cast<uint64_t>(c0 + ch) * M * K],
@@ -78,9 +75,8 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
         WaitFlag<HardEvent::MTE2_MTE1>(e21);
     }
     for (int32_t pass = 0; pass < 2; ++pass) {
-        // Issue every chunk's L1 load before touching L0: the GM round trips of
-        // one chunk then overlap the arithmetic of the previous one.  Each pass
-        // loads its own right-hand side (pass 0 = rk -> W, pass 1 = rv -> U).
+        // Issue every chunk's L1 load before touching L0 so one chunk's GM
+        // round trips overlap the previous chunk's arithmetic.
         for (int32_t ch = 0; ch < nch; ++ch) {
             // a16Mode 1 must not draw from qa: allocated-but-unqueued slots
             // remain unavailable and the second pass would block on them.
@@ -92,7 +88,6 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
                 DataCopy(la, A16[static_cast<uint64_t>(c0 + ch) * M * K],
                          Nd2NzParams(1, M, K, 0, K, M, 1, 0));
 #else
-                // KF == 1: use the plain single-call copy.
                 DataCopy(la, A16[static_cast<uint64_t>(c0 + ch) * M * K], M * K);
 #endif
                 qa.EnQue(la);
@@ -101,7 +96,6 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
 #if KDA_CHUNK > 16
             GlobalTensor<bfloat16_t> &rhs = (pass == 0) ? Rk : Rv;
             if (loadMode == 1) {
-                // Copy the chunk's KF bands in one call.
                 DataCopy(lb, rhs[static_cast<uint64_t>(c0 + ch) * M * D],
                          Nd2NzParams(KF, 16, D, 16 * D, D, 16, 1, 16 * D));
             } else {

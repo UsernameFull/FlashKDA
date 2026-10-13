@@ -156,7 +156,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         LocalTensor<bfloat16_t> l0b = b8.ReinterpretCast<bfloat16_t>();
 
         for (int32_t chunk = 0; chunk < NT; ++chunk) {
-            // ---- stage 1: d1 = W @ S16^T, d2 = Qg @ S16^T for every head
+            // Stage 1: d1 = W @ S16^T, d2 = Qg @ S16^T for every head.
             for (int32_t s = 0; s < nh; ++s) {
                 const int32_t bh = heads[s];
                 const uint64_t a0 = static_cast<uint64_t>(bh * NT + chunk) * M * D;
@@ -230,7 +230,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 WaitFlag<HardEvent::M_MTE1>(em1);
                 CrossCoreSetFlag<2, PIPE_FIX>(FL_C1);
             }
-            // ---- stage 3: d3 = Aqk @ v_new, d4 = v_new^T @ kg for every head
+            // Stage 3: d3 = Aqk @ v_new, d4 = v_new^T @ kg for every head.
             for (int32_t s = 0; s < nh; ++s) {
                 const int32_t bh = heads[s];
                 const int32_t c = bh * NT + chunk;
@@ -448,7 +448,6 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         LocalTensor<float> dec = udec.Get<float>();
         LocalTensor<float> st = us.Get<float>();
 
-        // ---- start-up: bring the fp32 state on chip, publish the bf16 copy
         for (int32_t s = 0; s < nh; ++s) {
             const int32_t task = heads[s] * nv + iv;
             LocalTensor<float> state = st[s * S_TILE];
@@ -487,7 +486,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         }
 
         for (int32_t chunk = 0; chunk < NT; ++chunk) {
-            // ---- stage 2: v_new = u - d1 (and its transpose) per head
+            // Stage 2: v_new = u - d1 (and its transpose) per head.
             for (int32_t s = 0; s < nh; ++s) {
                 const int32_t bh = heads[s];
                 const int32_t task = bh * nv + iv;
@@ -550,7 +549,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 DataCopy(Vt[out0], vt, BV * M);
                 CrossCoreSetFlag<2, PIPE_MTE3>(FL_V);
             }
-            // ---- stage 4: out = d2*scale + d3 and the state recurrence
+            // Stage 4: out = d2 * scale + d3 and the state recurrence.
             for (int32_t s = 0; s < nh; ++s) {
                 const int32_t bh = heads[s];
                 const int32_t task = bh * nv + iv;
@@ -632,7 +631,6 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 CrossCoreSetFlag<2, PIPE_MTE3>(FL_R);
             }
         }
-        // ---- finally: publish the fp32 state
         SetFlag<HardEvent::V_MTE3>(ev3);
         WaitFlag<HardEvent::V_MTE3>(ev3);
         for (int32_t s = 0; s < nh; ++s) {

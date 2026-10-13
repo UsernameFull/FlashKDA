@@ -10,10 +10,9 @@
 //
 // which holds for I + L split as [[I+L11, 0], [L21, I+L22]] with L strictly
 // lower.  X11/X22 arrive in Xb, and Lneg21 is the negated bf16 export.  This
-// kernel is the only writer of the parent tile's lower-left block.
-// This kernel's output is the only writer of the parent tile's lower-left
-// block; the wide kernel writes its diagonal and zeroes its strict upper
-// triangle (the Cube solve reads all of it).
+// kernel's output is the only writer of the parent tile's lower-left block;
+// the wide kernel writes its diagonal and zeroes its strict upper triangle
+// (the Cube solve reads all of it).
 //
 // P = Lneg21 @ X11 goes through GM because L0C has no path back into
 // L0A/L0B.  The two Mmads are split into passes, with each pass's L1 loads
@@ -128,8 +127,6 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
     // The assemble only launches at C = 64 in production, so the fallback is
     // for the compile-only legs and any future geometry.
     constexpr bool CAN_BATCH_STORE = (MM % 256) == 0;
-    // Mode 3 adds a batched store, mode 4 adds the whole-window fill, and
-    // mode 5 composes both.
     const bool batched_store = (loadMode == 3 || loadMode == 5) && CAN_BATCH_STORE;
     const bool window = (loadMode >= 4);
     TPipe pipe;
