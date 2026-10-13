@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Build launcher.so for AscendC RTC kernel compilation and execution
+# Build the AscendC RTC host launcher for kernel compilation and execution
 # Usage: ./build_launcher.sh
 
 cd "$(dirname "$0")"
@@ -26,7 +26,7 @@ if name == 'kda_ascendc_v1_launcher':
 
 launcher = load(
     name=name,
-    sources=['launcher.cpp'],
+    sources=['flash_kda.cpp'],
     extra_cflags=['-O3', '-std=c++17', '-I' + inc],
     extra_ldflags=['-L' + lib, '-lascendcl', '-lacl_rtc'],
     verbose=True,

@@ -6,9 +6,6 @@ from typing import Optional
 import torch
 from torch.nn import functional as F
 
-from ..cpp_extension_asc import is_loaded, load_extension
-
-
 CHUNK = 64
 LOWER_BOUND_DEFAULT = -5.0
 ATOL = RTOL = 5e-3

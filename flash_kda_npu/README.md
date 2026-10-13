@@ -1,14 +1,31 @@
 # FlashKDA Ascend NPU backend
 
-This directory adds the Ascend NPU implementation for FlashKDA.  The active
-native path is the AscendC v1 backend ported from the `kda-ascendc` release:
-the launcher exposes RTC compilation/launch APIs and
+This directory adds the Ascend NPU implementation for FlashKDA.  The native
+path uses the AscendC v1 backend ported from the `kda-ascendc` release: the
+host launcher exposes RTC compilation/launch APIs and
 `flash_kda_npu/kda_ascendc_v1/api.py` orchestrates the three production
 stages (`pre_gram`, `solve`, and persistent-loop `k2`).
 
-The older `cpp_extension_asc` AOT scaffold and `csrc/CMakeLists.txt` are kept
-for the follow-on CMake/AOT migration.  They are not used by the current
-`ops/kda_fwd.py` dispatch path.
+## Layout
+
+```text
+flash_kda_npu/
+|-- csrc/
+|   |-- flash_kda.cpp
+|   |-- fwd.h
+|   |-- build_launcher.sh
+|   `-- ascendc/
+|       |-- fwd_kernel1_pre_gram.cpp
+|       |-- fwd_kernel1_solve_wide.cpp
+|       |-- fwd_kernel1_solve_assemble.cpp
+|       |-- fwd_kernel1_solve_cube.cpp
+|       `-- fwd_kernel2_persistent.cpp
+|-- kda_ascendc_v1/
+|   |-- api.py
+|   `-- layout.py
+`-- ops/
+    `-- kda_fwd.py
+```
 
 ## Build
 
@@ -17,18 +34,17 @@ On an Ascend host with CANN configured:
 ```bash
 source /usr/local/Ascend/cann-9.1.0/set_env.sh
 export LAUNCHER_NAME=kda_ascendc_v1_launcher
-bash flash_kda_npu/launcher/build_launcher.sh
+bash flash_kda_npu/csrc/build_launcher.sh
 ```
 
 The launcher is cached under `build/S02_clean/torch_extensions`.  AscendC
-kernel sources live in `flash_kda_npu/csrc/kernels/v1/`.  They are RTC compiled
-into the launcher process on first use.  The production chunk size is fixed by
-`KDA_CHUNK=64`, which is also the default.
+kernel sources in `csrc/ascendc/` are RTC compiled into the launcher process on
+first use.  The production chunk size is fixed by `KDA_CHUNK=64`, which is also
+the default.
 
 ## Usage
 
 ```python
-import torch
 import flash_kda
 
 flash_kda.fwd(
@@ -78,8 +94,8 @@ The default benchmark uses the FlashKDA bf16 gate.  Passing `--gate-dtype fp32`
 measures the release-kernel aligned input.  On the container's Ascend A3
 device with 10 warmup and 20 timed iterations:
 
-- release-aligned fp32 `g`: `min 7.32 ms / median 7.34 ms`;
-- standard bf16 `g` (one dtype conversion): `min 7.62 ms / median 7.64 ms`.
+- release-aligned fp32 `g`: `min 7.30 ms / median 7.32 ms`;
+- standard bf16 `g` (one dtype conversion): `min 7.66 ms / median 7.68 ms`.
 
 The porting-source release path measured approximately `7.14 ms` with fp32
 `g`.  Timing uses `torch.npu.Event`; `triton.testing.do_bench` is not used

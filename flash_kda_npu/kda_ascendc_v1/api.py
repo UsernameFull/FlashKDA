@@ -92,7 +92,8 @@ SOLVE_SLICE_TARGET = int(os.environ.get("KDA_SOLVE_SLICE_TARGET", "20"))
 # staging has to fit in the rest of this part's 192 KB.  R3 halved that
 # staging by aliasing it across the two phases the loop alternates (stage 2
 # and stage 4, each of which opens with a PIPE_ALL drain): 112.5 KB -> 56.5 KB
-# at C=64, 46.5 -> 26.5 KB at C=16 (kernels/v1/k2_persistent_loop.cpp carries
+# at C=64, 46.5 -> 26.5 KB at C=16
+# (csrc/ascendc/fwd_kernel2_persistent.cpp carries
 # the budget).  That is what makes 4 heads fit at every chunk size -
 # 128 + 56.5 = 184.5 KB of 192 at C=64, 128 + 36.5 = 164.5 at C=32 - where
 # the old layout capped C=64/32 at 2 (176.5 KB).  A UB overrun is a
@@ -131,7 +132,7 @@ BV = 64
 NV = 2
 # The K2 recurrence has exactly one implementation: the device-side chunk
 # loop walks KDA_CHUNK rows at a time and follows the build
-# (kernels/v1/k2_persistent_loop.cpp).
+# (csrc/ascendc/fwd_kernel2_persistent.cpp).
 PERSISTENT_LOOP = "persistent_loop"
 _COMPILED = False
 _LAST_PROFILE: dict[str, object] = {}
@@ -552,7 +553,7 @@ def compile_config() -> dict[str, int]:
 
 
 def _rtc(rel: str, name: str) -> None:
-    """Compile ``kernels/v1/<rel>`` as ``name``, defines prefix included.
+    """Compile ``csrc/ascendc/<rel>`` as ``name``, defines prefix included.
 
     Every RTC compile of this package has to come through here (see
     ``_defines``); the C=16-only kernels of the S12-S15 experiments ignore the
@@ -571,11 +572,11 @@ def _rtc(rel: str, name: str) -> None:
 
 
 _SOURCES: list[tuple[str, str]] = [
-    ("flash_kda_npu/csrc/kernels/v1/k1_pre_gram_mix.cpp", "kda_pre_gram_mix"),
-    ("flash_kda_npu/csrc/kernels/v1/k1_solve_wu_wide.cpp", "kda_solve_wu_wide"),
-    ("flash_kda_npu/csrc/kernels/v1/k1_solve_assemble.cpp", "kda_solve_assemble"),
-    ("flash_kda_npu/csrc/kernels/v1/k1_solve_wu_cube.cpp", "kda_solve_wu_cube_kernel"),
-    ("flash_kda_npu/csrc/kernels/v1/k2_persistent_loop.cpp", "kda_k2_persistent_loop"),
+    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_pre_gram.cpp", "kda_pre_gram_mix"),
+    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_wide.cpp", "kda_solve_wu_wide"),
+    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_assemble.cpp", "kda_solve_assemble"),
+    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_cube.cpp", "kda_solve_wu_cube_kernel"),
+    ("flash_kda_npu/csrc/ascendc/fwd_kernel2_persistent.cpp", "kda_k2_persistent_loop"),
 ]
 
 
@@ -839,7 +840,7 @@ def _kda_fwd_impl(
     # Mmads per step.  The Gram half is 1.05 ms of the vector-only block's
     # 2.21 ms and the vector pipe is the bottleneck of the whole stage, so
     # the Cube's work is hidden behind the AIV's remaining ~3.3 us per chunk
-    # (see kernels/v1/k1_pre_gram_mix.cpp).
+    # (see csrc/ascendc/fwd_kernel1_pre_gram.cpp).
     gram_ops = torch.empty((3, c, CHUNK, D), dtype=torch.bfloat16, device=q.device)
     # The cross-band k side of the (1, 0) Gram block: a CHUNK = 64 gate
     # needs one decay reference per 32-row band, and the Gram block that

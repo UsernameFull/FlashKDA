@@ -16,23 +16,13 @@ def build_npu_extension() -> None:
     home = ascend_home()
     if not home:
         return
-    build_dir = os.path.join(this_dir, "build", "flash_kda_npu-cmake")
-    cmake_args = [
-        "-S",
-        os.path.join(this_dir, "flash_kda_npu", "csrc"),
-        "-B",
-        build_dir,
-        "-DCMAKE_BUILD_TYPE=Release",
-        f"-DASCEND_HOME_PATH={home}",
-    ]
-    subprocess.run(["cmake", *cmake_args], check=True)
+    script = os.path.join(this_dir, "flash_kda_npu", "csrc", "build_launcher.sh")
+    env = os.environ.copy()
+    env.setdefault("LAUNCHER_NAME", "kda_ascendc_v1_launcher")
     subprocess.run(
-        ["cmake", "--build", build_dir, "--config", "Release", "--parallel"],
+        ["bash", script],
         check=True,
-    )
-    subprocess.run(
-        ["cmake", "--install", build_dir, "--prefix", this_dir],
-        check=True,
+        env=env,
     )
 
 
@@ -133,15 +123,14 @@ setup(
     description='FlashKDA: Flash Kimi Delta Attention',
     ext_modules=ext_modules,
     packages=['flash_kda', 'flash_kda_npu', 'flash_kda_npu.ops',
-              'flash_kda_npu.cpp_extension_asc',
               'flash_kda_npu.kda_ascendc_v1'],
     package_data={
-        'flash_kda_npu.cpp_extension_asc': ['lib/**/*.so', 'lib/**/*.dll'],
         'flash_kda_npu': [
             'README.md',
-            'csrc/kernels/v1/*.cpp',
-            'launcher/launcher.cpp',
-            'launcher/build_launcher.sh',
+            'csrc/*.cpp',
+            'csrc/*.h',
+            'csrc/*.sh',
+            'csrc/ascendc/*.cpp',
         ],
     },
     cmdclass=cmdclass,
