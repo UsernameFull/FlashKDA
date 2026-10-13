@@ -32,7 +32,6 @@ On an Ascend host with CANN configured:
 
 ```bash
 source /usr/local/Ascend/cann-9.1.0/set_env.sh
-export LAUNCHER_NAME=flash_kda_npu_launcher
 bash flash_kda_npu/csrc/build_launcher.sh
 ```
 

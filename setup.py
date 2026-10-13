@@ -17,12 +17,9 @@ def build_npu_extension() -> None:
     if not home:
         return
     script = os.path.join(this_dir, "flash_kda_npu", "csrc", "build_launcher.sh")
-    env = os.environ.copy()
-    env.setdefault("LAUNCHER_NAME", "flash_kda_npu_launcher")
     subprocess.run(
         ["bash", script],
         check=True,
-        env=env,
     )
 
 
