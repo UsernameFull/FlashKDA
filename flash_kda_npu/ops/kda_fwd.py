@@ -170,13 +170,92 @@ def _torch_fallback(
         final_state.copy_(state_work.reshape(final_state.shape))
 
 
-def _supports_native_npu(q: torch.Tensor, v: torch.Tensor, g: torch.Tensor) -> bool:
-    return (
-        q.ndim == 4
-        and q.shape[-1] == 128
-        and v.shape[-1] == 128
-        and g.dtype == torch.bfloat16
+def _supports_native_npu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    out: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    initial_state: Optional[torch.Tensor],
+    final_state: Optional[torch.Tensor],
+    cu_seqlens: Optional[torch.Tensor],
+) -> bool:
+    if q.device.type != "npu":
+        return False
+    if q.ndim != 4 or q.shape[-1] != 128 or v.shape[-1] != 128:
+        return False
+    if cu_seqlens is not None or q.shape[1] % CHUNK:
+        return False
+    if q.shape != k.shape or q.shape != v.shape or q.shape != g.shape:
+        return False
+    if beta.shape != q.shape[:3]:
+        return False
+    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16:
+        return False
+    if v.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+        return False
+    if not out.is_contiguous():
+        return False
+    if g.dtype not in (torch.bfloat16, torch.float32):
+        return False
+    if A_log.numel() != q.shape[2]:
+        return False
+    if tuple(dt_bias.shape) != (q.shape[2], q.shape[-1]):
+        return False
+    if initial_state is not None:
+        expected = (q.shape[0], q.shape[2], q.shape[-1], q.shape[-1])
+        if tuple(initial_state.shape) != expected:
+            return False
+    if final_state is not None:
+        expected = (q.shape[0], q.shape[2], q.shape[-1], q.shape[-1])
+        if tuple(final_state.shape) != expected:
+            return False
+        if final_state.dtype != torch.float32:
+            return False
+    return True
+
+
+def _run_ascendc(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    out: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float,
+    initial_state: Optional[torch.Tensor],
+    final_state: Optional[torch.Tensor],
+) -> None:
+    from ..kda_ascendc_v1.api import kda_bt16_fwd_ascendc
+
+    state_output = (
+        final_state.contiguous() if final_state is not None else None
     )
+    output, state = kda_bt16_fwd_ascendc(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        g.contiguous().to(torch.float32) if g.dtype != torch.float32 else g.contiguous(),
+        beta.contiguous().to(torch.float32),
+        scale=float(scale),
+        initial_state=None if initial_state is None else initial_state.contiguous().to(torch.float32),
+        output_final_state=final_state is not None,
+        A_log=A_log.contiguous().to(torch.float32),
+        bias=dt_bias.contiguous().to(torch.float32),
+        lower_bound=float(lower_bound),
+        out=out,
+        final_state=state_output,
+    )
+    out.copy_(output)
+    if (final_state is not None and state is not None
+            and state.data_ptr() != final_state.data_ptr()):
+        final_state.copy_(state)
 
 
 def fwd(
@@ -195,32 +274,18 @@ def fwd(
     cu_seqlens: Optional[torch.Tensor] = None,
 ) -> None:
     """Run FlashKDA forward on Ascend NPU, with a PyTorch fallback."""
-
-    use_native = False
-    if is_available() and _supports_native_npu(q, v, g):
+    if is_available() and _supports_native_npu(
+        q, k, v, g, beta, out, A_log, dt_bias,
+        initial_state, final_state, cu_seqlens,
+    ):
         try:
-            load_extension()
-            use_native = is_loaded()
-        except (FileNotFoundError, OSError, RuntimeError):
-            use_native = False
-    if use_native:
-        load_extension()
-        torch.ops.flash_kda_npu.fwd(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            float(scale),
-            out,
-            A_log,
-            dt_bias,
-            float(lower_bound),
-            initial_state,
-            final_state,
-            cu_seqlens,
-        )
-        return
+            _run_ascendc(
+                q, k, v, g, beta, float(scale), out, A_log, dt_bias,
+                float(lower_bound), initial_state, final_state,
+            )
+            return
+        except ImportError:
+            pass
 
     _torch_fallback(
         q,

@@ -133,9 +133,16 @@ setup(
     description='FlashKDA: Flash Kimi Delta Attention',
     ext_modules=ext_modules,
     packages=['flash_kda', 'flash_kda_npu', 'flash_kda_npu.ops',
-              'flash_kda_npu.cpp_extension_asc'],
+              'flash_kda_npu.cpp_extension_asc',
+              'flash_kda_npu.kda_ascendc_v1'],
     package_data={
         'flash_kda_npu.cpp_extension_asc': ['lib/**/*.so', 'lib/**/*.dll'],
+        'flash_kda_npu': [
+            'README.md',
+            'csrc/kernels/v1/*.cpp',
+            'launcher/launcher.cpp',
+            'launcher/build_launcher.sh',
+        ],
     },
     cmdclass=cmdclass,
     zip_safe=False,

@@ -1,74 +1,86 @@
-# FlashKDA Ascend NPU Backend
+# FlashKDA Ascend NPU backend
 
-This package provides the Ascend NPU path for FlashKDA. It uses an AOT-built
-`TORCH_LIBRARY` extension when CANN is available and falls back to a pure
-PyTorch implementation for unsupported shapes or hosts without the extension.
+This directory adds the Ascend NPU implementation for FlashKDA.  The active
+native path is the AscendC v1 backend ported from the `kda-ascendc` release:
+the launcher exposes RTC compilation/launch APIs and
+`flash_kda_npu/kda_ascendc_v1/api.py` orchestrates the three production
+stages (`pre_gram`, `solve`, and persistent-loop `k2`).
 
-## Requirements
-
-- PyTorch 2.4 or newer
-- CANN with the AscendC AOT toolchain (target: Ascend 910C/A3)
-- `ASCEND_HOME_PATH` pointing to the CANN installation
-- `torch_npu` when running on an NPU
+The older `cpp_extension_asc` AOT scaffold and `csrc/CMakeLists.txt` are kept
+for the follow-on CMake/AOT migration.  They are not used by the current
+`ops/kda_fwd.py` dispatch path.
 
 ## Build
 
-Install from the repository root:
+On an Ascend host with CANN configured:
 
 ```bash
-export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0
-pip install -v --no-build-isolation .
+source /usr/local/Ascend/cann-9.1.0/set_env.sh
+export LAUNCHER_NAME=kda_ascendc_v1_launcher
+bash flash_kda_npu/launcher/build_launcher.sh
 ```
 
-`setup.py` detects `ASCEND_HOME_PATH` and invokes
-`flash_kda_npu/csrc/CMakeLists.txt`. CMake builds `kda_k1.cpp`, `kda_k2.cpp`,
-and `kda_host.cpp` into `libflash_kda_npu_kernels`. The compiled library is
-packaged under `flash_kda_npu/cpp_extension_asc/lib/`.
+The launcher is cached under `build/S02_clean/torch_extensions`.  AscendC
+kernel sources live in `flash_kda_npu/csrc/kernels/v1/`.  They are RTC compiled
+into the launcher process on first use.  The production chunk size is fixed by
+`KDA_CHUNK=64`, which is also the default.
 
-The default target architecture is `dav-c90`. Override it for a different CANN
-toolchain with:
-
-```bash
-cmake -DCMAKE_ASC_ARCHITECTURES=dav-c90 ...
-```
-
-The kernel sources are ordinary `.cpp` files. They use the
-`FLASH_KDA_ASC_OPERATOR` entry-point contract provided by the CANN ASC CMake
-package. `kda_host.cpp` registers the operator through `TORCH_LIBRARY` and also
-provides a complete ATen composite implementation for hosts where the AOT kernel
-package is unavailable.
-
-## API
-
-The top-level API remains:
+## Usage
 
 ```python
+import torch
 import flash_kda
 
-flash_kda.fwd(q, k, v, g, beta, scale, out, A_log=A_log, dt_bias=dt_bias,
-              lower_bound=-5.0, initial_state=h0, final_state=h1,
-              cu_seqlens=cu_seqlens)
+flash_kda.fwd(
+    q, k, v, g, beta, scale, out,
+    A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0,
+    initial_state=h0, final_state=h1, cu_seqlens=None,
+)
 ```
 
-CUDA tensors use the CUDA kernel. Other devices, including NPU, use this
-backend. The NPU path supports the standard FlashKDA signatures and
-fixed-length and `cu_seqlens` layouts.
+`flash_kda.fwd` sends non-CUDA tensors to `flash_kda_npu.ops.fwd`.  On NPU it
+first checks whether the native AscendC path can run and otherwise falls back to
+the chunked PyTorch implementation.
+
+The native path currently requires:
+
+- NPU tensors with `K = V = 128` and `T % 64 == 0`;
+- fixed-length batches (`cu_seqlens is None`);
+- contiguous bf16 `q/k/v/out`;
+- bf16 or fp32 `g`, fp32 `A_log/dt_bias`, and a contiguous fp32
+  `final_state` when one is requested;
+- `initial_state`, when present, in fp32 or bf16 (converted for the kernel).
+
+Unsupported shapes and varlen inputs fall back to PyTorch.
 
 ## Precision
 
-`lower_bound` is constrained to `[-5, 0]` by the native backend. State updates
-accumulate in fp32. When neither `initial_state` nor `final_state` is fp32,
-the chunk-to-chunk state is stored in bf16. Numerical validation uses
-`atol=rtol=5e-3`.
+The native K2 recurrence keeps inter-chunk state in fp32.  Gate activation uses
+the FlashKDA default lower bound `-5.0`.  Numerical tests compare against the
+fp64/fp32 PyTorch reference with `rtol=atol=5e-3`.
 
 ## Tests
 
-Run host-side dispatch and fallback tests with:
-
 ```bash
-pytest tests/test_npu_dispatch.py
+python -m pytest -q tests/test_npu_dispatch.py tests/test_npu_precision.py
 ```
 
-Precision, fallback, and A3 benchmark validation require an NPU host. The A3
-baseline should use `B=1, T=8192, H=96, K=V=128` and compare against the
-Triton-Ascend path before release.
+The precision test covers the native path on an NPU host.  Dispatch/fallback
+tests also run on hosts without NPU.
+
+## Benchmark
+
+```bash
+python tools/bench_npu_dispatch.py --batch 1 --steps 8192 --heads 96 --dim 128 --gate-dtype fp32
+```
+
+The default benchmark uses the FlashKDA bf16 gate.  Passing `--gate-dtype fp32`
+measures the release-kernel aligned input.  On the container's Ascend A3
+device with 10 warmup and 20 timed iterations:
+
+- release-aligned fp32 `g`: `min 7.32 ms / median 7.34 ms`;
+- standard bf16 `g` (one dtype conversion): `min 7.62 ms / median 7.64 ms`.
+
+The porting-source release path measured approximately `7.14 ms` with fp32
+`g`.  Timing uses `torch.npu.Event`; `triton.testing.do_bench` is not used
+because this container's Triton-Ascend build fails kernel compilation.
