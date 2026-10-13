@@ -16,7 +16,7 @@ def build_npu_extension() -> None:
     home = ascend_home()
     if not home:
         return
-    script = os.path.join(this_dir, "flash_kda_npu", "csrc", "build_launcher.sh")
+    script = os.path.join(this_dir, "flash_kda_npu", "csrc", "build.sh")
     subprocess.run(
         ["bash", script],
         check=True,

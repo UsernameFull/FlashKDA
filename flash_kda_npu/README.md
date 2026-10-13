@@ -13,7 +13,7 @@ flash_kda_npu/
 |-- csrc/
 |   |-- flash_kda.cpp
 |   |-- fwd.h
-|   |-- build_launcher.sh
+|   |-- build.sh
 |   `-- ascendc/
 |       |-- fwd_kernel1_pre_gram.cpp
 |       |-- fwd_kernel1_solve_wide.cpp
@@ -32,7 +32,7 @@ On an Ascend host with CANN configured:
 
 ```bash
 source /usr/local/Ascend/cann-9.1.0/set_env.sh
-bash flash_kda_npu/csrc/build_launcher.sh
+bash flash_kda_npu/csrc/build.sh
 ```
 
 The launcher is cached under `build/S02_clean/torch_extensions`.  AscendC
