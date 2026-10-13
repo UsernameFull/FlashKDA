@@ -35,10 +35,19 @@ source /usr/local/Ascend/cann-9.1.0/set_env.sh
 bash flash_kda_npu/csrc/build.sh
 ```
 
-The launcher is cached under `build/S02_clean/torch_extensions`.  AscendC
-kernel sources in `csrc/ascendc/` are RTC compiled into the launcher process on
-first use.  The production chunk size is fixed by `KDA_CHUNK=64`, which is also
-the default.
+The launcher is packaged in `flash_kda_npu/lib`.  AscendC kernel sources in
+`csrc/ascendc/` are RTC compiled into the launcher process on first use.  The
+production chunk size is fixed by `KDA_CHUNK=64`, which is also the default.
+
+To install the NPU backend with pip from a repository checkout:
+
+```bash
+pip install --no-build-isolation .
+```
+
+`--no-build-isolation` uses the existing PyTorch installation; on an NPU host
+this should already include `torch_npu`.  A Git checkout can also be installed
+directly with `pip install --no-build-isolation git+https://github.com/UsernameFull/FlashKDA.git@npu`.
 
 ## Usage
 

@@ -13,8 +13,14 @@ import torch_npu
 
 from .ascendc_layout import pack_tokens
 
-ROOT = Path(__file__).resolve().parents[2]
-EXT = ROOT / "build/S02_clean/torch_extensions/flash_kda_npu_launcher"
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+ROOT = PACKAGE_ROOT.parent
+EXT = PACKAGE_ROOT / "lib"
+LEGACY_EXT = ROOT / "build/S02_clean/torch_extensions/flash_kda_npu_launcher"
+if not (EXT / "flash_kda_npu_launcher.so").exists() and (
+    LEGACY_EXT / "flash_kda_npu_launcher.so"
+).exists():
+    EXT = LEGACY_EXT
 import sys
 if str(EXT) not in sys.path:
     sys.path.insert(0, str(EXT))

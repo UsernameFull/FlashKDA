@@ -17,7 +17,7 @@ if [[ -z "$TORCH_PREFIX" || -z "$PYTHON_INCLUDE" ]]; then
 fi
 
 ROOT="$(cd ../.. && pwd)"
-BUILD_DIR="$ROOT/build/S02_clean/torch_extensions/flash_kda_npu_launcher"
+BUILD_DIR="$ROOT/flash_kda_npu/lib"
 OUTPUT="$BUILD_DIR/flash_kda_npu_launcher.so"
 SOURCE="$PWD/flash_kda.cpp"
 HEADER="$PWD/fwd.h"

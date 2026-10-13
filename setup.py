@@ -127,6 +127,7 @@ setup(
             'csrc/*.h',
             'csrc/*.sh',
             'csrc/ascendc/*.cpp',
+            'lib/*.so',
         ],
     },
     cmdclass=cmdclass,
