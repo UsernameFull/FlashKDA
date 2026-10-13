@@ -20,10 +20,9 @@ ROOT="$(cd ../.. && pwd)"
 BUILD_DIR="$ROOT/flash_kda_npu/lib"
 OUTPUT="$BUILD_DIR/flash_kda_npu_launcher.so"
 SOURCE="$PWD/flash_kda.cpp"
-HEADER="$PWD/fwd.h"
 mkdir -p "$BUILD_DIR"
 
-if [[ -f "$OUTPUT" && "$OUTPUT" -nt "$SOURCE" && "$OUTPUT" -nt "$HEADER" ]]; then
+if [[ -f "$OUTPUT" && "$OUTPUT" -nt "$SOURCE" ]]; then
     echo "flash_kda_npu_launcher.so is up to date: $OUTPUT"
     exit 0
 fi
