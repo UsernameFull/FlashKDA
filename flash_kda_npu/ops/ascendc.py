@@ -11,8 +11,6 @@ from typing import Any
 import torch
 import torch_npu
 
-from .ascendc_layout import pack_tokens
-
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 ROOT = PACKAGE_ROOT.parent
 EXT = PACKAGE_ROOT / "lib"

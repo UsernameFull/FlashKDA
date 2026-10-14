@@ -12,7 +12,6 @@ stages (`pre_gram`, `solve`, and persistent-loop `k2`).
 flash_kda_npu/
 |-- csrc/
 |   |-- flash_kda.cpp
-|   |-- fwd.h
 |   |-- build.sh
 |   `-- ascendc/
 |       |-- fwd_kernel1_pre_gram.cpp
@@ -22,7 +21,6 @@ flash_kda_npu/
 |       `-- fwd_kernel2_persistent.cpp
 `-- ops/
     |-- ascendc.py
-    |-- ascendc_layout.py
     `-- kda_fwd.py
 ```
 
