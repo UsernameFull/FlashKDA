@@ -169,49 +169,19 @@ def _torch_fallback(
 
 def _supports_native_npu(
     q: torch.Tensor,
-    k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
-    beta: torch.Tensor,
-    out: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    initial_state: Optional[torch.Tensor],
-    final_state: Optional[torch.Tensor],
     cu_seqlens: Optional[torch.Tensor],
 ) -> bool:
+    """Coarse dispatch gate; ascendc._check_inputs validates the details."""
     if q.device.type != "npu":
         return False
     if q.ndim != 4 or q.shape[-1] != 128 or v.shape[-1] != 128:
         return False
     if cu_seqlens is not None or q.shape[1] % CHUNK:
         return False
-    if q.shape != k.shape or q.shape != v.shape or q.shape != g.shape:
-        return False
-    if beta.shape != q.shape[:3]:
-        return False
-    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16:
-        return False
-    if v.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
-        return False
-    if not out.is_contiguous():
-        return False
     if g.dtype not in (torch.bfloat16, torch.float32):
         return False
-    if A_log.numel() != q.shape[2]:
-        return False
-    if tuple(dt_bias.shape) != (q.shape[2], q.shape[-1]):
-        return False
-    if initial_state is not None:
-        expected = (q.shape[0], q.shape[2], q.shape[-1], q.shape[-1])
-        if tuple(initial_state.shape) != expected:
-            return False
-    if final_state is not None:
-        expected = (q.shape[0], q.shape[2], q.shape[-1], q.shape[-1])
-        if tuple(final_state.shape) != expected:
-            return False
-        if final_state.dtype != torch.float32:
-            return False
     return True
 
 
@@ -271,17 +241,14 @@ def fwd(
     cu_seqlens: Optional[torch.Tensor] = None,
 ) -> None:
     """Run FlashKDA forward on Ascend NPU, with a PyTorch fallback."""
-    if is_available() and _supports_native_npu(
-        q, k, v, g, beta, out, A_log, dt_bias,
-        initial_state, final_state, cu_seqlens,
-    ):
+    if _supports_native_npu(q, v, g, cu_seqlens):
         try:
             _run_ascendc(
                 q, k, v, g, beta, float(scale), out, A_log, dt_bias,
                 float(lower_bound), initial_state, final_state,
             )
             return
-        except ImportError:
+        except (ImportError, ValueError, TypeError):
             pass
 
     _torch_fallback(

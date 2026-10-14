@@ -22,7 +22,7 @@ from flash_kda_npu_launcher import launch_argsarray_engine, rtc_compile
 # define (see _defines).  Production builds with 64.
 CHUNK = int(os.environ.get("KDA_CHUNK", "64"))
 # Only these chunk sizes are validated; anything else is refused in
-# _kda_fwd_impl before the RTC compile.
+# kda_bt16_fwd_ascendc before the RTC compile.
 SUPPORTED_CHUNKS = frozenset({16, 32, 64})
 # Chunks one wide-solve block handles, capped by the 192 KB UB: four live
 # [NC, CHUNK, CHUNK] tiles plus the Brcb expansion.  At CHUNK = 64 the
@@ -70,8 +70,6 @@ WU_NCHUNK = int(os.environ.get("KDA_WU_NCHUNK", "0")) or (4 if CHUNK <= 32 else 
 D = 128
 BV = 64
 NV = 2
-# The K2 recurrence has exactly one implementation.
-PERSISTENT_LOOP = "persistent_loop"
 _COMPILED = False
 _LAST_PROFILE: dict[str, object] = {}
 # Triangular 0/1 masks for the intra-chunk Gram kernel, built once per device.
@@ -100,57 +98,34 @@ def _tri_eye(device: torch.device, n: int | None = None) -> torch.Tensor:
     return eye
 
 
-# The pre_gram launch's grid: one MIX block pairs an AIC with two AIV
-# subcores and walks 2 * `pre_unroll` chunks, so the stage's wall is (whole
-# AIC waves) x unroll block-steps.  The picker reads cube_core_num
-# (KDA_AIC_CORES overrides it) and minimizes waves x unroll, capped at 88.
-# unroll is a runtime arg: a tiling choice, not a recompile.
-_AIC_CORES: dict = {}
+# Cached per-device core counts; the env vars override the device property.
+_CORE_COUNTS: dict = {}
 
 
-def _aic_core_count(device) -> int:
-    key = str(device)
-    n = _AIC_CORES.get(key)
-    if n is None:
-        n = int(os.environ.get("KDA_AIC_CORES", "0") or 0)
-        if not n:
-            try:
-                idx = device.index
-                if idx is None:
-                    idx = torch_npu.npu.current_device()
-                n = int(torch_npu.npu.get_device_properties(idx).cube_core_num)
-            except Exception:
-                n = 20
-        _AIC_CORES[key] = n
-    return n
-
-
-_AIV_CORES: dict = {}
-
-
-def _aiv_core_count(device) -> int:
-    """Vector (AIV) core count - the unit the wide solve schedules over.
-
-    Read from device properties (KDA_AIV_CORES overrides); falls back to
-    2 x cube cores (one AIC + two AIV per MIX block).
-    """
-    key = str(device)
-    n = _AIV_CORES.get(key)
-    if n is None:
-        n = int(os.environ.get("KDA_AIV_CORES", "0") or 0)
+def _core_count(device, prop: str, env: str) -> int:
+    entry = _CORE_COUNTS.setdefault(str(device), {})
+    if prop not in entry:
+        n = int(os.environ.get(env, "0") or 0)
         if not n:
             try:
                 idx = device.index
                 if idx is None:
                     idx = torch_npu.npu.current_device()
                 props = torch_npu.npu.get_device_properties(idx)
-                n = int(getattr(props, "vector_core_num", 0) or 0)
-                if not n:
-                    n = 2 * int(props.cube_core_num)
+                n = int(getattr(props, prop, 0) or 0)
             except Exception:
-                n = 2 * _aic_core_count(device)
-        _AIV_CORES[key] = n
-    return n
+                n = 0
+        entry[prop] = n
+    return entry[prop]
+
+
+def _aic_core_count(device) -> int:
+    return _core_count(device, "cube_core_num", "KDA_AIC_CORES") or 20
+
+
+def _aiv_core_count(device) -> int:
+    n = _core_count(device, "vector_core_num", "KDA_AIV_CORES")
+    return n if n else 2 * _aic_core_count(device)
 
 
 def _solve_padded_chunks(c: int) -> int:
@@ -180,17 +155,16 @@ def _solve_slice_chunks(c_solve: int, unit: int, nch: int, aiv_cores: int,
 
 
 def _pre_gram_unroll(c: int, cores: int) -> int:
-    """Chunk pairs per block whose launch is a whole number of AIC waves."""
+    """Chunks per pre_gram block: search all sizes for the fewest wave steps."""
     if c < 256:
         return 1
-    best = None
-    for k in range(1, 65):
-        u = min(88, max(1, -(-c // (2 * cores * k))))
+    best_u, best_steps = 1, None
+    for u in range(88, 0, -1):
         grid = -(-c // (2 * u))
         steps = -(-grid // cores) * u
-        if best is None or steps < best[0]:
-            best = (steps, k, u)
-    return best[2]
+        if best_steps is None or steps < best_steps:
+            best_steps, best_u = steps, u
+    return best_u
 
 
 def _pack_ptrs(xs):
@@ -495,7 +469,6 @@ def kda_bt16_fwd_ascendc(
     bias: torch.Tensor | None = None,
     lower_bound: float = -5.0,
     return_intermediates: bool = False,
-    k2_mode: str | None = None,
     out: torch.Tensor | None = None,
     final_state: torch.Tensor | None = None,
 ):
@@ -505,41 +478,6 @@ def kda_bt16_fwd_ascendc(
     ``beta`` and ``A_log``/``bias`` are FP32; returns ``(out, final_state)``,
     plus the stage tensors when ``return_intermediates`` is set.
 
-    ``k2_mode`` names the K2 (state recurrence) implementation and defaults to
-    ``"persistent_loop"``: one MIX launch runs the whole chunk loop and keeps
-    the fp32 state in UB; it is the implementation this release ships.
-    """
-    if k2_mode is None:
-        k2_mode = PERSISTENT_LOOP
-    if k2_mode != PERSISTENT_LOOP:
-        raise ValueError("unsupported k2_mode %r (only %r)"
-                         % (k2_mode, PERSISTENT_LOOP))
-    return _kda_fwd_impl(
-        q, k, v, g, beta, scale=scale, initial_state=initial_state,
-        output_final_state=output_final_state, A_log=A_log, bias=bias,
-        lower_bound=lower_bound, return_intermediates=return_intermediates,
-        k2_mode=k2_mode, out=out, final_state=final_state)
-
-
-def _kda_fwd_impl(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    *,
-    scale: float | None = None,
-    initial_state: torch.Tensor | None = None,
-    output_final_state: bool = False,
-    A_log: torch.Tensor | None = None,
-    bias: torch.Tensor | None = None,
-    lower_bound: float = -5.0,
-    return_intermediates: bool = False,
-    k2_mode: str = PERSISTENT_LOOP,
-    out: torch.Tensor | None = None,
-    final_state: torch.Tensor | None = None,
-):
-    """The one implementation both entry points call; ``k2_mode`` is validated.
     """
     # Builds outside the validated set are refused before anything is compiled
     # or launched: a silently wrong answer is the one failure mode this package
@@ -584,9 +522,6 @@ def _kda_fwd_impl(
                 or final_state.device != q.device or not final_state.is_contiguous()):
             raise ValueError(
                 "final_state must be contiguous FP32 [B,H,128,128]")
-    if k2_mode != PERSISTENT_LOOP:
-        raise ValueError("unsupported k2_mode %r (only %r)"
-                         % (k2_mode, PERSISTENT_LOOP))
     if scale is None:
         scale = D ** -0.5
     nt = t // CHUNK
@@ -719,73 +654,72 @@ def _kda_fwd_impl(
                 stream)
     finish("solve_ms", "solve_start")
 
-    if k2_mode == PERSISTENT_LOOP:
-        # One device-side chunk loop: each block owns up to MAXH heads, keeps
-        # its fp32 state in UB across all chunks and never writes S32 until
-        # the end, so the whole recurrence is a single MIX launch.  The block
-        # count must keep the head map total: nblk * MAXH >= bh.
-        aic_cores = _aic_core_count(q.device)
-        # Pick the heads per block: minimize whole waves x heads, ties to the
-        # larger block count; one head per block only while it fits a single
-        # wave.
-        best = None
-        for mh in range(1, PERSIST_MAXH + 1):
-            if mh == 1 and bh > aic_cores:
-                continue
-            nb = (bh + mh - 1) // mh
-            steps = -(-nb // aic_cores) * mh
-            if best is None or steps <= best[0]:
-                best = (steps, mh)
-        maxh = best[1]
-        want = int(os.environ.get("KDA_PERSIST_LOOP_BLOCKS", "0"))
-        nblk = want if 0 < want <= bh else (bh if bh <= aic_cores
-                                           else (bh + maxh - 1) // maxh)
-        # The stride map is total as long as ceil(bh / nblk) fits the array
-        # cap *PERSIST_MAXH*, not the heads the picker chose - so a `want`
-        # below the picked heads-per-block stays legal.
-        nblk = max(nblk, (bh + PERSIST_MAXH - 1) // PERSIST_MAXH)
-        s32 = (final_state.view(bh, NV, BV, D).reshape(tasks, BV, D)
-               if final_state is not None else
-               torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device))
-        s16 = torch.empty((tasks, BV, D), dtype=torch.bfloat16, device=q.device)
-        # d1/d2/d3 cross to the vector side as bf16 (the loop's fixpipe rounds
-        # them), so they are allocated bf16: an fp32 allocation would be
-        # silently half-filled.
-        d1 = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
-        d2 = torch.empty_like(d1)
-        d3 = torch.empty_like(d1)
-        d4f = torch.empty((bh, D, D), dtype=torch.float32, device=q.device)
-        # The loop writes the public [B, T, H, D] layout directly with a
-        # strided store, so no host-side permute is needed.
-        out_public = out if out is not None else torch.empty(
-            (b, t, h, D), dtype=torch.bfloat16, device=q.device)
-        # `vnew` is written solely for ``return_intermediates`` (the kernel
-        # reads only `vnew_t`); production passes a null pointer.
-        vnew = (torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
-                if return_intermediates else None)
-        vnew_t = torch.empty((tasks, nt, BV, CHUNK), dtype=torch.bfloat16, device=q.device)
-        h0 = None if initial_state is None else initial_state.view(bh, D, D)
-        # kg goes to the loop in its public [c, CHUNK, D] layout: the AIC loads
-        # it into L1 with Nd2Nz and transposes each 16x16 fractal on the way
-        # into L0B (LoadDataWithTranspose).
-        mark("k2_start")
-        _launch("kda_k2_persistent_loop", nblk,
-                _pack_ptrs([U, W, qg, aqk16, kg, decay, d1, d2, d3, d4f,
-                            out_public, vnew, vnew_t, h0, s32, s16]) +
-                [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale), _i(h)], stream)
-        finish("k2_ms", "k2_start")
-        final_state = None if not output_final_state else (
-            final_state if final_state is not None else
-            s32.view(bh, NV, BV, D).reshape(b, h, D, D))
-        if profile:
-            prof["total_ms"] = sum(v for k, v in prof.items() if k.endswith("_ms"))
-            _LAST_PROFILE = prof
-        if not return_intermediates:
-            return out_public, final_state
-        debug = {"Qn": qn, "Kn": kn, "Gate": gate, "Gc": gc, "Beta": beta_out,
-                 "Decay": decay, "Rk": rk, "Rv": rv, "Qg": qg, "Kg": kg,
-                 "Aqk32": aqk32, "Aqk": aqk16, "L": L[:c], "A32": a32[:c], "A16": a16[:c],
-                 "W": W, "U": U, "d1": d1, "d2": d2, "Vnew": vnew, "VnewT": vnew_t,
-                 "d3": d3, "d4": d4f, "state_s32": s32}
-        return out_public, final_state, debug
+    # One device-side chunk loop: each block owns up to MAXH heads, keeps
+    # its fp32 state in UB across all chunks and never writes S32 until
+    # the end, so the whole recurrence is a single MIX launch.  The block
+    # count must keep the head map total: nblk * MAXH >= bh.
+    aic_cores = _aic_core_count(q.device)
+    # Pick the heads per block: minimize whole waves x heads, ties to the
+    # larger block count; one head per block only while it fits a single
+    # wave.
+    best = None
+    for mh in range(1, PERSIST_MAXH + 1):
+        if mh == 1 and bh > aic_cores:
+            continue
+        nb = (bh + mh - 1) // mh
+        steps = -(-nb // aic_cores) * mh
+        if best is None or steps <= best[0]:
+            best = (steps, mh)
+    maxh = best[1]
+    want = int(os.environ.get("KDA_PERSIST_LOOP_BLOCKS", "0"))
+    nblk = want if 0 < want <= bh else (bh if bh <= aic_cores
+                                        else (bh + maxh - 1) // maxh)
+    # The stride map is total as long as ceil(bh / nblk) fits the array
+    # cap *PERSIST_MAXH*, not the heads the picker chose - so a `want`
+    # below the picked heads-per-block stays legal.
+    nblk = max(nblk, (bh + PERSIST_MAXH - 1) // PERSIST_MAXH)
+    s32 = (final_state.view(bh, NV, BV, D).reshape(tasks, BV, D)
+           if final_state is not None else
+           torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device))
+    s16 = torch.empty((tasks, BV, D), dtype=torch.bfloat16, device=q.device)
+    # d1/d2/d3 cross to the vector side as bf16 (the loop's fixpipe rounds
+    # them), so they are allocated bf16: an fp32 allocation would be
+    # silently half-filled.
+    d1 = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
+    d2 = torch.empty_like(d1)
+    d3 = torch.empty_like(d1)
+    d4f = torch.empty((bh, D, D), dtype=torch.float32, device=q.device)
+    # The loop writes the public [B, T, H, D] layout directly with a
+    # strided store, so no host-side permute is needed.
+    out_public = out if out is not None else torch.empty(
+        (b, t, h, D), dtype=torch.bfloat16, device=q.device)
+    # `vnew` is written solely for ``return_intermediates`` (the kernel
+    # reads only `vnew_t`); production passes a null pointer.
+    vnew = (torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
+            if return_intermediates else None)
+    vnew_t = torch.empty((tasks, nt, BV, CHUNK), dtype=torch.bfloat16, device=q.device)
+    h0 = None if initial_state is None else initial_state.view(bh, D, D)
+    # kg goes to the loop in its public [c, CHUNK, D] layout: the AIC loads
+    # it into L1 with Nd2Nz and transposes each 16x16 fractal on the way
+    # into L0B (LoadDataWithTranspose).
+    mark("k2_start")
+    _launch("kda_k2_persistent_loop", nblk,
+            _pack_ptrs([U, W, qg, aqk16, kg, decay, d1, d2, d3, d4f,
+                        out_public, vnew, vnew_t, h0, s32, s16]) +
+            [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale), _i(h)], stream)
+    finish("k2_ms", "k2_start")
+    final_state = None if not output_final_state else (
+        final_state if final_state is not None else
+        s32.view(bh, NV, BV, D).reshape(b, h, D, D))
+    if profile:
+        prof["total_ms"] = sum(v for k, v in prof.items() if k.endswith("_ms"))
+        _LAST_PROFILE = prof
+    if not return_intermediates:
+        return out_public, final_state
+    debug = {"Qn": qn, "Kn": kn, "Gate": gate, "Gc": gc, "Beta": beta_out,
+             "Decay": decay, "Rk": rk, "Rv": rv, "Qg": qg, "Kg": kg,
+             "Aqk32": aqk32, "Aqk": aqk16, "L": L[:c], "A32": a32[:c], "A16": a16[:c],
+             "W": W, "U": U, "d1": d1, "d2": d2, "Vnew": vnew, "VnewT": vnew_t,
+             "d3": d3, "d4": d4f, "state_s32": s32}
+    return out_public, final_state, debug
 
