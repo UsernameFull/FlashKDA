@@ -118,16 +118,19 @@ The native path through the public API currently requires:
 The wrapper validates public inputs before any conversion or native launch.
 It converts the validated bf16 `g`/`beta` and optional initial state to fp32
 for the internal AscendC interface. It does not repair noncontiguous inputs,
-or silently accept other public dtypes. Aligned fixed-length inputs pass the
-caller's output buffers directly to AscendC. Partial chunks and unequal-length
-sequences use temporary native batches, then copy results into caller buffers.
+or silently accept other public dtypes. All fixed-length inputs pass the
+caller's input/output buffers directly to AscendC, including partial chunks.
+The pre-Gram kernel reads only valid rows and zero-fills the tail in UB; K2
+writes only valid output rows using the original batch stride. Only the small
+head-major beta buffer needs tail padding. Unequal-length packed sequences
+still use temporary native batches, then copy results into caller buffers.
 
 Public sequence lengths need not be chunk-aligned and may be shorter than one
 chunk. Packed boundaries must start at zero, end at `T`, and be nondecreasing;
 empty packed sequences preserve their initial state (or return zero state).
 The lower-level
-`flash_kda_npu.ops.ascendc.kda_bt16_fwd_ascendc` accepts lengths divisible
-by the configured chunk size and returns `(out, final_state)`; it requires
+`flash_kda_npu.ops.ascendc.kda_bt16_fwd_ascendc` accepts any positive fixed
+sequence length and returns `(out, final_state)`; it requires
 fp32 gate/beta/parameters/initial state directly and uses `bias` instead of
 `dt_bias`.
 
@@ -138,7 +141,7 @@ fixed and variable lengths with partial chunks. Public tensor validation failure
 Unequal-length sequences are grouped by length rounded up to `KDA_CHUNK` and
 run as native AscendC batches. Each sequence adds fewer than one chunk of
 padding; a short sequence is never padded to the longest sequence in the input.
-Q/K/V padding is zero. The pre-Gram kernel explicitly sets padded gate
+For packed groups, Q/K/V padding is zero. The pre-Gram kernel explicitly sets padded gate
 log-decay to zero before its prefix sum, so padded tokens do not decay or
 update the final state. All KDA arithmetic stays in AscendC; PyTorch is used
 for packing and copying, with no PyTorch KDA fallback. Equal aligned lengths
@@ -152,8 +155,10 @@ these costs when comparing end-to-end performance.
 
 ## Configuration and profiling
 
-The default native chunk size is 64. Public partial chunks are padded to the
-configured size (16, 32 or 64), with neutral state transitions in padded rows.
+The default native chunk size is 64. Partial chunks use full computation tiles
+of the configured size (16, 32 or 64), with neutral state transitions in
+invalid rows. Fixed-length input tails are filled on chip, without packing
+the full Q/K/V/g inputs or copying a temporary output back.
 
 Warm up before benchmarking to exclude first-use RTC compilation and
 mask/identity initialization. For native execution analysis, set `KDA_PROFILE=1`

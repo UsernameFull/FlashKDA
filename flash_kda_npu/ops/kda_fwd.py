@@ -95,7 +95,7 @@ def _run_ascendc(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
 
     # AscendC consumes FP32 gate parameters and initial state internally. Public
     # dtypes have already been validated against CUDA's contract.
-    if cu_seqlens is None and q.shape[1] % ascendc.CHUNK == 0:
+    if cu_seqlens is None:
         ascendc.kda_bt16_fwd_ascendc(
             q, k, v, g.float(), beta.float(), scale=float(scale),
             initial_state=None if initial_state is None else initial_state.float(),

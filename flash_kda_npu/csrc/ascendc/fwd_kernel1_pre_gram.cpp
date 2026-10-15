@@ -441,10 +441,10 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     int32_t xRowBytes, int32_t gRowBytes) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     if ASCEND_IS_AIC {
-        run_gram_aic(pGa, pGk, pGb, pGx, pAqk32, pL, B * H * (T / M), unroll);
+        run_gram_aic(pGa, pGk, pGb, pGx, pAqk32, pL, B * H * ((T + M - 1) / M), unroll);
     }
     if ASCEND_IS_AIV {
-    const int32_t nt = T / M;
+    const int32_t nt = (T + M - 1) / M;
     const DataCopyPadExtParams<bfloat16_t> padNop(false, 0, 0, 0);
     const DataCopyPadExtParams<float> padNopF(false, 0, 0, 0);
     const DataCopyPadExtParams<float> padScalar(true, 0, 7, 0);
@@ -586,10 +586,12 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // The downstream buffers keep the packed order.
     const int32_t b = bh / H;
     const int32_t ck = c - bh * nt;
-    int32_t validRows = M;
+    const int32_t physicalRows = T - ck * M;
+    int32_t validRows = physicalRows < M ? physicalRows : M;
     if (pLengths != nullptr) {
         const int32_t remaining = reinterpret_cast<__gm__ int32_t *>(pLengths)[b] - ck * M;
-        validRows = remaining < 0 ? 0 : (remaining < M ? remaining : M);
+        const int32_t logicalRows = remaining < 0 ? 0 : remaining;
+        if (logicalRows < validRows) validRows = logicalRows;
     }
     const uint64_t xb = (static_cast<uint64_t>(b) * T + static_cast<uint64_t>(ck) * M) *
                             static_cast<uint64_t>(H) * D +
@@ -601,7 +603,9 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // The cumsum runs along the rows, so the whole chunk has to be in one
     // tile; everything else below is row-local and is walked in NP passes of
     // MT rows, which is what keeps the staging at its KDA_CHUNK = 16 size.
-    DataCopyPad(gf, G[xb], DataCopyExtParams(M, D * 4, gRowBytes, 0, 0), padNopF);
+    if (validRows > 0) {
+        DataCopyPad(gf, G[xb], DataCopyExtParams(validRows, D * 4, gRowBytes, 0, 0), padNopF);
+    }
     SetFlag<HardEvent::MTE2_V>(e2vg);
     if (headChanged) {
         // A_log has exactly H elements.  Fetch just this scalar, including
@@ -614,6 +618,10 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // UB, and the wait is the only consumer of this channel.
     SetFlag<HardEvent::MTE2_V>(e2vs);
     WaitFlag<HardEvent::MTE2_V>(e2vg);
+    if (validRows < M) {
+        Duplicate(gf[validRows * D], 0.0f, (M - validRows) * D);
+        PipeBarrier<PIPE_V>();
+    }
 
     WaitFlag<HardEvent::MTE2_V>(e2vs);
     Muls(beta, beta, -1.0f, M);
@@ -730,13 +738,27 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     const uint64_t xbh = xb + static_cast<uint64_t>(hp) * MT * H * D;
     LocalTensor<float> gfp = gf[gh];
     LocalTensor<float> bbp = bb[hp * MT * 8];
-    DataCopyPad(qnb, Q[xbh], DataCopyExtParams(MT, D * 2, xRowBytes, 0, 0), padNop);
+    const int32_t remainingRows = validRows - hp * MT;
+    const int32_t rows = remainingRows < 0 ? 0 : (remainingRows < MT ? remainingRows : MT);
+    if (rows > 0) {
+        DataCopyPad(qnb, Q[xbh], DataCopyExtParams(rows, D * 2, xRowBytes, 0, 0), padNop);
+    }
     SetFlag<HardEvent::MTE2_V>(e2vq);
-    DataCopyPad(knb, K[xbh], DataCopyExtParams(MT, D * 2, xRowBytes, 0, 0), padNop);
+    if (rows > 0) {
+        DataCopyPad(knb, K[xbh], DataCopyExtParams(rows, D * 2, xRowBytes, 0, 0), padNop);
+    }
     SetFlag<HardEvent::MTE2_V>(e2vk);
-    DataCopyPad(rvb, V[xbh], DataCopyExtParams(MT, D * 2, xRowBytes, 0, 0), padNop);
+    if (rows > 0) {
+        DataCopyPad(rvb, V[xbh], DataCopyExtParams(rows, D * 2, xRowBytes, 0, 0), padNop);
+    }
     SetFlag<HardEvent::MTE2_V>(e2vv);
     WaitFlag<HardEvent::MTE2_V>(e2vq);
+    if (rows < MT) {
+        // Zero bf16 bits through half: no numeric conversion and no GM
+        // reads beyond the physical sequence, including wholly empty passes.
+        Duplicate(qnb.ReinterpretCast<half>()[rows * D], half(0.0f), (MT - rows) * D);
+        PipeBarrier<PIPE_V>();
+    }
     Cast(qf, qnb, RoundMode::CAST_NONE, NG);
     PipeBarrier<PIPE_V>();
 
@@ -757,6 +779,10 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     PipeBarrier<PIPE_V>();
 
     WaitFlag<HardEvent::MTE2_V>(e2vk);
+    if (rows < MT) {
+        Duplicate(knb.ReinterpretCast<half>()[rows * D], half(0.0f), (MT - rows) * D);
+        PipeBarrier<PIPE_V>();
+    }
     Cast(kf, knb, RoundMode::CAST_NONE, NG);
     PipeBarrier<PIPE_V>();
     Mul(t2, kf, kf, NG);
@@ -803,6 +829,10 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
 
     // rv = v * beta
     WaitFlag<HardEvent::MTE2_V>(e2vv);
+    if (rows < MT) {
+        Duplicate(rvb.ReinterpretCast<half>()[rows * D], half(0.0f), (MT - rows) * D);
+        PipeBarrier<PIPE_V>();
+    }
     Cast(t2, rvb, RoundMode::CAST_NONE, NG);
     PipeBarrier<PIPE_V>();
     Mul(t2, t2, bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));

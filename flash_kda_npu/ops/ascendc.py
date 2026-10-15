@@ -348,7 +348,7 @@ _SOURCES: list[tuple[str, str, list[int]]] = [
     ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_wide.cpp", "kda_solve_wu_wide", [8] * 4 + [4]),
     ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_assemble.cpp", "kda_solve_assemble", [8] * 2 + [4]),
     ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_cube.cpp", "kda_solve_wu_cube_kernel", [8] * 5 + [4]),
-    ("flash_kda_npu/csrc/ascendc/fwd_kernel2_persistent.cpp", "kda_k2_persistent_loop", [8] * 15 + [4] * 7),
+    ("flash_kda_npu/csrc/ascendc/fwd_kernel2_persistent.cpp", "kda_k2_persistent_loop", [8] * 15 + [4] * 8),
 ]
 if SOLVE_FUSE:
     _SOURCES = [entry for entry in _SOURCES if entry[1] not in (
@@ -391,8 +391,8 @@ def _check_inputs(q, k, v, g, beta, A_log, bias, initial_state):
     if q.ndim != 4 or tuple(q.shape) != tuple(k.shape) or tuple(q.shape) != tuple(v.shape):
         raise ValueError("q/k/v must have identical [B,T,H,128] shape")
     b, t, h, d = q.shape
-    if d != D or t < CHUNK or t % CHUNK:
-        raise ValueError("support is T>=%d, T%%%d==0, D=128" % (CHUNK, CHUNK))
+    if b < 1 or h < 1 or t < 1 or d != D:
+        raise ValueError("support is B,H,T > 0, D=128")
     if g.shape != q.shape or g.dtype != torch.float32:
         raise ValueError("g must be FP32 [B,T,H,128]")
     if beta.shape != (b, t, h) or beta.dtype != torch.float32:
@@ -422,7 +422,7 @@ def _merge_profiles(profiles, real_tokens, padded_tokens):
     """Publish all native groups belonging to one packed public call."""
     global _LAST_PROFILE, _LAUNCH_COUNTS, _LAUNCH_BLOCKS
     _LAST_PROFILE = dict(sequence_groups=len(profiles), real_tokens=real_tokens,
-                         padded_tokens=padded_tokens)
+                         padded_tokens=padded_tokens, input_packing=bool(profiles))
     _LAUNCH_COUNTS, _LAUNCH_BLOCKS = {}, {}
     for profile in profiles:
         for key, value in profile.items():
@@ -466,6 +466,7 @@ def kda_bt16_fwd_ascendc(
 
     ``q/k/v`` are BF16 ``[B, T, H, 128]``, ``g`` is FP32 ``[B, T, H, 128]``,
     ``beta`` and ``A_log``/``bias`` are FP32; returns ``(out, final_state)``,
+    Any positive fixed sequence length is supported, including partial chunks.
     ``valid_lengths`` is internal packing metadata: counts in [0, T], with
     zero Q/K/V beyond each count. The public dispatcher constructs these buffers.
     """
@@ -519,7 +520,7 @@ def kda_bt16_fwd_ascendc(
                 "final_state must be contiguous FP32 or BF16 [B,H,128,128]")
     if scale is None:
         scale = D ** -0.5
-    nt = t // CHUNK
+    nt = (t + CHUNK - 1) // CHUNK
     bh = b * h
     c = bh * nt
     tasks = bh * NV
@@ -533,7 +534,15 @@ def kda_bt16_fwd_ascendc(
     # DataCopy cannot express that gather on this part).
     qk_row_bytes = h * D * 2 - D * 2
     g_row_bytes = h * D * 4 - D * 4
-    beta_pack = beta.view(b, nt, CHUNK, h).permute(0, 3, 1, 2).contiguous().view(c, CHUNK)
+    if t % CHUNK == 0:
+        beta_pack = beta.view(b, nt, CHUNK, h).permute(0, 3, 1, 2).contiguous().view(c, CHUNK)
+    else:
+        # Beta already needs a head-major copy. Pad only this small scalar
+        # buffer; pre-Gram reads Q/K/V/g directly, padding their tails in UB.
+        beta_pack = torch.empty((b, h, nt * CHUNK), dtype=beta.dtype, device=q.device)
+        beta_pack[:, :, :t].copy_(beta.permute(0, 2, 1))
+        beta_pack[:, :, t:].zero_()
+        beta_pack = beta_pack.view(c, CHUNK)
     stream = torch_npu.npu.current_stream().npu_stream
     _compile_all()
 
@@ -671,7 +680,7 @@ def kda_bt16_fwd_ascendc(
             _pack_ptrs([U, W, qg, aqk16, kg, decay, d1, d2, d3, d4f,
                         out_public, vnew_t, h0, state_output, s16]) +
             [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale), _i(h),
-             _i(state_output is not None and state_output.dtype == torch.bfloat16)], stream)
+             _i(state_output is not None and state_output.dtype == torch.bfloat16), _i(t)], stream)
     finish("k2_ms", "k2_start")
     final_state = None if not output_final_state else (
         final_state if final_state is not None else
@@ -679,5 +688,7 @@ def kda_bt16_fwd_ascendc(
     if profile:
         prof["total_ms"] = sum(v for k, v in prof.items() if k.endswith("_ms"))
         _LAST_PROFILE = prof
+    _LAST_PROFILE.update(sequence_groups=1, real_tokens=b * t,
+                         padded_tokens=b * nt * CHUNK, input_packing=False)
     return out_public, final_state
 

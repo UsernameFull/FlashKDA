@@ -112,7 +112,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
     GM_ADDR pOut, GM_ADDR pVnewT,
     GM_ADDR pH0, GM_ADDR pFinal, GM_ADDR pS16,
     int32_t BH, int32_t NT, int32_t NV, int32_t NBLK, float scale, int32_t NH,
-    int32_t finalBF16) {
+    int32_t finalBF16, int32_t T) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     const int32_t nv = NV;
 
@@ -611,11 +611,14 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                         // [b, t, h, D] directly: one 4-block (128 B) run per
                         // chunk row, the next row NH * D elements further on.
                         const int32_t hh = bh - (bh / NH) * NH;
-                        const uint64_t obase = (static_cast<uint64_t>(bh / NH) * NT + chunk) *
-                                                   (static_cast<uint64_t>(M) * NH * D) +
+                        const uint64_t token = static_cast<uint64_t>(bh / NH) * T +
+                                               static_cast<uint64_t>(chunk) * M;
+                        const uint64_t obase = token * NH * D +
                                                static_cast<uint64_t>(hh) * D + iv * BV;
+                        const int32_t remaining = T - chunk * M;
+                        const int32_t rows = remaining < M ? remaining : M;
                         DataCopy(Out[obase], ob,
-                                 DataCopyParams(M, BV / 16, 0,
+                                 DataCopyParams(rows, BV / 16, 0,
                                                 static_cast<uint16_t>(NH * D / 16 - BV / 16)));
                     }
                     if (publish) {

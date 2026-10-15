@@ -159,6 +159,72 @@ def test_native_partial_state_io(steps, state_dtype, has_in, has_out):
     check_native(2, steps, 2, state_dtype, has_in, has_out)
 
 
+@pytest.mark.parametrize("tail", range(1, 64))
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_native_tail_direct_buffers(monkeypatch, tail, state_dtype):
+    """Every tail size matches neutral padding, without packing caller buffers."""
+    from flash_kda_npu.ops import ascendc
+    if tail >= ascendc.CHUNK:
+        pytest.skip("tail must be smaller than the configured chunk")
+    batch, heads = 2, 3
+    steps = ascendc.CHUNK + tail
+    inputs = make_inputs(batch, steps, heads, "npu")
+    q, k, v, g, beta, a_log, bias = inputs
+    initial = make_state(batch, heads, 128, state_dtype, "npu")
+    guard = 256
+    out_storage = torch.full((q.numel() + 2 * guard,), 11, dtype=q.dtype, device=q.device)
+    out = out_storage[guard:-guard].view_as(q)
+    state_storage = torch.full((initial.numel() + 2 * guard,), 7,
+                               dtype=state_dtype, device=q.device)
+    final = state_storage[guard:-guard].view_as(initial)
+    native = ascendc.kda_bt16_fwd_ascendc
+    calls = []
+
+    def direct(*args, **kwargs):
+        calls.append((args[0].data_ptr(), kwargs["out"].data_ptr(),
+                      kwargs["final_state"].data_ptr()))
+        assert kwargs.get("valid_lengths") is None
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(ascendc, "kda_bt16_fwd_ascendc", direct)
+    flash_kda.fwd(q, k, v, g, beta, 128 ** -0.5, out, a_log, bias, -5.0,
+                  initial_state=initial, final_state=final)
+    assert calls == [(q.data_ptr(), out.data_ptr(), final.data_ptr())]
+    assert ascendc.get_last_profile()["input_packing"] is False
+
+    padded = 2 * ascendc.CHUNK
+    packed = []
+    for x in (q, k, v, g, beta):
+        target = torch.zeros((batch, padded, *x.shape[2:]), dtype=x.dtype, device=x.device)
+        target[:, :steps].copy_(x)
+        packed.append(target)
+    expected, expected_state = native(
+        *packed[:3], packed[3].float(), packed[4].float(), scale=128 ** -0.5,
+        initial_state=initial.float(), output_final_state=True,
+        final_state=torch.empty_like(initial), A_log=a_log, bias=bias,
+        valid_lengths=torch.full((batch,), steps, dtype=torch.int32, device=q.device))
+    torch.npu.synchronize()
+    torch.testing.assert_close(out, expected[:, :steps], rtol=0, atol=0)
+    torch.testing.assert_close(final, expected_state, rtol=0, atol=0)
+    for storage, sentinel in ((out_storage, 11), (state_storage, 7)):
+        assert bool((storage[:guard] == sentinel).all())
+        assert bool((storage[-guard:] == sentinel).all())
+
+
+@pytest.mark.parametrize("unroll", [1, 3, 8])
+@pytest.mark.parametrize("gate_value", [-8.0, 8.0])
+def test_native_tail_unroll(monkeypatch, unroll, gate_value):
+    from flash_kda_npu.ops.ascendc import CHUNK
+    monkeypatch.setenv("KDA_PRE_UNROLL", str(unroll))
+    check_native(3, CHUNK * 5 + 1, 3, gate_value=gate_value)
+
+
+def test_native_tail_long(request):
+    if not request.config.getoption("--run-long"):
+        pytest.skip("use --run-long for a long direct tail")
+    check_native(1, 65537, 1)
+
+
 @pytest.mark.parametrize("lengths", [
     [16], [16, 16], [4, 8, 12], [64, 128, 256], [17, 33, 65],
     [0, 1, 0, 63, 65, 0], [64, 64], [0, 0],
