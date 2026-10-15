@@ -6,6 +6,13 @@ host launcher exposes RTC compilation/launch APIs and
 `flash_kda_npu/ops/ascendc.py` orchestrates the three production
 stages (`pre_gram`, `solve`, and persistent-loop `k2`).
 
+The NPU path is production-only: the diagnostic scheduling modes, debug
+GM stores (`Qn/Kn/Gate/Gc/BetaOut/Vnew/A32`) and the
+`return_intermediates` host path that the development build carried have
+all been removed, along with their environment-variable switches
+(`KDA_DEBUG_STORES`, `KDA_SOLVE_A16_MODE`, `KDA_ASM_LOADS`,
+`KDA_CUBE_A16_RESIDENT`, `KDA_CUBE_LOADS`, `KDA_PRE_RAW_MODE`).
+
 ## Layout
 
 ```text
@@ -19,6 +26,10 @@ flash_kda_npu/
 |       |-- fwd_kernel1_solve_assemble.cpp
 |       |-- fwd_kernel1_solve_cube.cpp
 |       `-- fwd_kernel2_persistent.cpp
+|-- tests/
+|   |-- flashkda_reference.py
+|   |-- test_fwd.py
+|   `-- test_fwd_full.py
 `-- ops/
     |-- ascendc.py
     `-- kda_fwd.py
@@ -83,11 +94,14 @@ fp64/fp32 PyTorch reference with `rtol=atol=5e-3`.
 ## Tests
 
 ```bash
-python -m pytest -q tests/test_npu_dispatch.py tests/test_npu_precision.py
+python -m pytest -q flash_kda_npu/tests/
 ```
 
-The precision test covers the native path on an NPU host.  Dispatch/fallback
-tests also run on hosts without NPU.
+Naming mirrors the CUDA suite: `test_fwd.py` checks the native path
+against the pure-PyTorch reference (`flashkda_reference.py`) on an NPU
+host; `test_fwd_full.py` covers dispatch decisions and the PyTorch
+fallback (varlen, unsupported dimensions), and runs on hosts without an
+NPU as well.
 
 ## Benchmark
 
@@ -99,9 +113,8 @@ The default benchmark uses the FlashKDA bf16 gate.  Passing `--gate-dtype fp32`
 measures the release-kernel aligned input.  On the container's Ascend A3
 device with 10 warmup and 20 timed iterations:
 
-- release-aligned fp32 `g`: `min 7.30 ms / median 7.32 ms`;
+- release-aligned fp32 `g`: `min 7.23 ms / median 7.27 ms`;
 - standard bf16 `g` (one dtype conversion): `min 7.66 ms / median 7.68 ms`.
 
-The porting-source release path measured approximately `7.14 ms` with fp32
-`g`.  Timing uses `torch.npu.Event`; `triton.testing.do_bench` is not used
+Timing uses `torch.npu.Event`; `triton.testing.do_bench` is not used
 because this container's Triton-Ascend build fails kernel compilation.
