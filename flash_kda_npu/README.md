@@ -104,43 +104,63 @@ since gate activation and sigmoid(beta) are also performed internally.
 
 The native path through the public API currently requires:
 
-- NPU tensors with matching `q/k/v` shape `[B,T,H,128]`, `T >= 64`,
-  and `T % 64 == 0`;
-- fixed-length batches (`cu_seqlens is None`);
+- NPU tensors with matching `q/k/v` shape `[B,T,H,128]`;
+- positive fixed-length batches, or packed variable-length inputs with `B=1`
+  and contiguous NPU int64 `cu_seqlens` of shape `[N+1]`;
 - bf16 `q/k/v/g/out` of the same shape, and bf16 `beta` with shape `[B,T,H]`;
 - fp32 `A_log` with shape `[H]` and fp32 `dt_bias` with shape `[H,128]`;
-- bf16 or fp32 `final_state` with shape `[B,H,128,128]` when requested;
-- bf16 or fp32 `initial_state`, when present, with shape `[B,H,128,128]`;
+- bf16 or fp32 `final_state` with shape `[N,H,128,128]` when requested;
+- bf16 or fp32 `initial_state`, when present, with shape `[N,H,128,128]`
+  (`N=B` for fixed-length batches);
 - matching initial/final state dtypes when both buffers are supplied, as on CUDA;
 - all tensors contiguous and on the same NPU, with positive batch/head counts.
 
 The wrapper validates public inputs before any conversion or native launch.
 It converts the validated bf16 `g`/`beta` and optional initial state to fp32
 for the internal AscendC interface. It does not repair noncontiguous inputs,
-silently accept other public dtypes, or copy through a temporary final-state
-buffer. The caller's output buffers are passed directly to AscendC.
+or silently accept other public dtypes. Aligned fixed-length inputs pass the
+caller's output buffers directly to AscendC. Partial chunks and unequal-length
+sequences use temporary native batches, then copy results into caller buffers.
 
-The public dispatch gate always checks divisibility by 64, even when
-`KDA_CHUNK` is 16 or 32. The lower-level
+Public sequence lengths need not be chunk-aligned and may be shorter than one
+chunk. Packed boundaries must start at zero, end at `T`, and be nondecreasing;
+empty packed sequences preserve their initial state (or return zero state).
+The lower-level
 `flash_kda_npu.ops.ascendc.kda_bt16_fwd_ascendc` accepts lengths divisible
 by the configured chunk size and returns `(out, final_state)`; it requires
 fp32 gate/beta/parameters/initial state directly and uses `bias` instead of
 `dt_bias`.
 
-The public dtype, state-buffer and failure contracts match CUDA. Native shape
-coverage is still narrower: CUDA supports varlen and partial chunks; NPU
-currently raises `NotImplementedError` for NPU `cu_seqlens` and `RuntimeError`
-for unsupported lengths or dimensions. Public tensor validation failures raise
+The public dtype, state-buffer and failure contracts match CUDA, including
+fixed and variable lengths with partial chunks. Public tensor validation failures raise
 `RuntimeError`; exceptions from the native implementation retain their types.
+
+Unequal-length sequences are grouped by length rounded up to `KDA_CHUNK` and
+run as native AscendC batches. Each sequence adds fewer than one chunk of
+padding; a short sequence is never padded to the longest sequence in the input.
+Q/K/V padding is zero. The pre-Gram kernel explicitly sets padded gate
+log-decay to zero before its prefix sum, so padded tokens do not decay or
+update the final state. All KDA arithmetic stays in AscendC; PyTorch is used
+for packing and copying, with no PyTorch KDA fallback. Equal aligned lengths
+are reshaped directly into a native batch without packing.
+
+The current packed dispatcher reads only `cu_seqlens` metadata on the host,
+which synchronizes that transfer, and launches one native pipeline per rounded
+length group. Packing, copies and metadata handling add overhead relative to
+aligned fixed-length input, especially for many distinct lengths. Include
+these costs when comparing end-to-end performance.
 
 ## Configuration and profiling
 
-The default native chunk size is 64. The public API requires `T % 64 == 0`,
-including when the native chunk size is configured to 16 or 32.
+The default native chunk size is 64. Public partial chunks are padded to the
+configured size (16, 32 or 64), with neutral state transitions in padded rows.
 
 Warm up before benchmarking to exclude first-use RTC compilation and
 mask/identity initialization. For native execution analysis, set `KDA_PROFILE=1`
 and inspect `flash_kda_npu.ops.ascendc.get_last_profile()` after a call.
+For packed calls it aggregates native launch counts and native stage timings
+across all groups and reports real/padded token counts; stage timings exclude
+packing and copying, whereas the benchmark includes them.
 Profiling synchronizes the device and affects timing; leave it disabled for
 end-to-end benchmarks.
 
@@ -157,7 +177,7 @@ launches for comparison. Chunk 16/32 keeps the single-level solve.
 
 `benchmarks/` mirrors the CUDA suite's structure: `bench.sh` sources CANN,
 installs the package and runs `bench_fwd.py` (three state variants, fixed
-cases, `torch.npu.Event` timing); `generate_benchmark_md.py`
+and variable-length cases, `torch.npu.Event` timing); `generate_benchmark_md.py`
 runs it twice (default `H` and `--H 64`) and writes `BENCHMARK_A3.md`.
 
 ```bash
@@ -167,14 +187,17 @@ bash flash_kda_npu/benchmarks/bench.sh --mode fixed --H 96
 # Require native execution, using an fp32 initial/final state:
 bash flash_kda_npu/benchmarks/bench.sh --mode fixed --state fp32 --require-native
 # Short native smoke run, with machine-readable timings:
-python flash_kda_npu/benchmarks/bench_fwd.py --T 128 --H 4 \
+python flash_kda_npu/benchmarks/bench_fwd.py --mode fixed --T 129 --H 4 \
     --warmup 1 --iters 2 --repeats 1 --json /tmp/npu-bench.json
+# Packed native smoke run with partial chunks:
+python flash_kda_npu/benchmarks/bench_fwd.py --mode varlen --seq-lens 17 33 65 \
+    --H 4 --warmup 1 --iters 2 --repeats 1
 # Generate BENCHMARK_A3.md (after installation and CANN setup):
 python flash_kda_npu/benchmarks/generate_benchmark_md.py --mode fixed
 ```
 
-Fixed-length mode is the default. Varlen selectors and unsupported dimensions
-or lengths produce an explicit error rather than a fallback benchmark.
+The default mode runs both fixed and variable-length cases, as in the CUDA suite.
+Use `--mode fixed` or `--mode varlen` to select one kind.
 All three state variants (bf16, no state, fp32) execute AscendC.
 The script defaults to `H=96`, 30 warmups, 200 iterations, and 5 repeats;
 `--gate-dtype` accepts `bf16`, matching the CUDA public contract.
@@ -182,12 +205,15 @@ The script defaults to `H=96`, 30 warmups, 200 iterations, and 5 repeats;
 always required. The report filename/device label does
 not change the RTC hardware target.
 
-State conversion and buffer allocation are outside the timed callable. Each
+Caller state buffers and their dtype conversions are prepared outside the timed
+callable; internal AscendC conversions and allocations remain inside it. Each
 variant reports the backend (`ascendc`), device-event
 latency, and mean wall latency per call. An untimed preflight checks that outputs
 and requested final states are finite. `--state` selects one state variant;
-`--T` overrides the fixed sequence length. JSON output preserves
-backend and timing metadata, and Markdown reports label each variant's backend.
+`--T` overrides the fixed sequence length and `--seq-lens` overrides packed
+lengths. JSON output preserves backend, timing, launch/group and padding
+metadata, and Markdown reports label each variant's backend. Wrapper packing,
+metadata transfer and copying are included in the timed callable.
 
 ## Precision
 
@@ -220,7 +246,8 @@ KDA_CHUNK=32 python -m pytest -q flash_kda_npu/tests/test_fwd.py -k configured_c
 `test_fwd.py` covers native state input/output combinations, bf16/fp32 initial
 and final states, rejection of mixed state types, gates, batch/head mapping,
 gate extremes, multiple chunks, alternate chunk sizes, and opt-in long
-sequences. These tests verify
+sequences. It also covers partial chunks (including one token), independent
+packed sequence states, empty sequences and invalid boundaries. These tests verify
 the persistent kernel launched. It also checks launcher ABI validation and
 device switching when two NPUs are available. `test_fwd_full.py` checks the
 public tensor contract, unsupported shapes, state dtype consistency, buffer

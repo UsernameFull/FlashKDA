@@ -436,6 +436,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     GM_ADDR pDecay, GM_ADDR pRk, GM_ADDR pRv, GM_ADDR pQg, GM_ADDR pKg,
     GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb, GM_ADDR pGx,
     GM_ADDR pAqk32, GM_ADDR pAqk16, GM_ADDR pL, GM_ADDR pMaskS, GM_ADDR pMaskL,
+    GM_ADDR pLengths,
     int32_t B, int32_t T, int32_t H, float lower_bound, float scale, int32_t unroll,
     int32_t xRowBytes, int32_t gRowBytes) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
@@ -585,6 +586,11 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // The downstream buffers keep the packed order.
     const int32_t b = bh / H;
     const int32_t ck = c - bh * nt;
+    int32_t validRows = M;
+    if (pLengths != nullptr) {
+        const int32_t remaining = reinterpret_cast<__gm__ int32_t *>(pLengths)[b] - ck * M;
+        validRows = remaining < 0 ? 0 : (remaining < M ? remaining : M);
+    }
     const uint64_t xb = (static_cast<uint64_t>(b) * T + static_cast<uint64_t>(ck) * M) *
                             static_cast<uint64_t>(H) * D +
                         static_cast<uint64_t>(head) * D;
@@ -653,6 +659,14 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Div(gfs, t2, gfs, NG);
     Muls(gfs, gfs, lower_bound, NG);
     PipeBarrier<PIPE_V>();
+    }
+    // Padded tokens must be identity state transitions, independent of gate
+    // logits, bias and A_log. Q/K/V padding is zero; neutralize log-decay here
+    // after activation and before the scan rather than approximating it with
+    // extreme logits. Only the final partial chunk takes this branch.
+    if (validRows < M) {
+        Duplicate(gf[validRows * D], 0.0f, (M - validRows) * D);
+        PipeBarrier<PIPE_V>();
     }
     // Blocked radix-8 prefix sum.  Its phases split aliasing read/write pairs
     // across instructions; a naive in-place log-scan would create repeat-level

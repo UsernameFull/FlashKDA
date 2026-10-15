@@ -344,7 +344,7 @@ def _rtc(rel: str, name: str, sizes: list[int]) -> None:
 
 
 _SOURCES: list[tuple[str, str, list[int]]] = [
-    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_pre_gram.cpp", "kda_pre_gram_mix", [8] * 21 + [4] * 8),
+    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_pre_gram.cpp", "kda_pre_gram_mix", [8] * 22 + [4] * 8),
     ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_wide.cpp", "kda_solve_wu_wide", [8] * 4 + [4]),
     ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_assemble.cpp", "kda_solve_assemble", [8] * 2 + [4]),
     ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_cube.cpp", "kda_solve_wu_cube_kernel", [8] * 5 + [4]),
@@ -418,6 +418,22 @@ def get_last_profile() -> dict[str, object]:
     return profile
 
 
+def _merge_profiles(profiles, real_tokens, padded_tokens):
+    """Publish all native groups belonging to one packed public call."""
+    global _LAST_PROFILE, _LAUNCH_COUNTS, _LAUNCH_BLOCKS
+    _LAST_PROFILE = dict(sequence_groups=len(profiles), real_tokens=real_tokens,
+                         padded_tokens=padded_tokens)
+    _LAUNCH_COUNTS, _LAUNCH_BLOCKS = {}, {}
+    for profile in profiles:
+        for key, value in profile.items():
+            if key.endswith("_ms"):
+                _LAST_PROFILE[key] = _LAST_PROFILE.get(key, 0.0) + value
+        for key, value in profile["launch_counts"].items():
+            _LAUNCH_COUNTS[key] = _LAUNCH_COUNTS.get(key, 0) + value
+        for key, value in profile["launch_blocks"].items():
+            _LAUNCH_BLOCKS[key] = _LAUNCH_BLOCKS.get(key, 0) + value
+
+
 def _on_input_device(fn):
     @wraps(fn)
     def run(q, *args, **kwargs):
@@ -444,11 +460,14 @@ def kda_bt16_fwd_ascendc(
     lower_bound: float = -5.0,
     out: torch.Tensor | None = None,
     final_state: torch.Tensor | None = None,
+    valid_lengths: torch.Tensor | None = None,
 ):
     """Run an opt-in AscendC KDA path; all KDA arithmetic stays on device.
 
     ``q/k/v`` are BF16 ``[B, T, H, 128]``, ``g`` is FP32 ``[B, T, H, 128]``,
     ``beta`` and ``A_log``/``bias`` are FP32; returns ``(out, final_state)``,
+    ``valid_lengths`` is internal packing metadata: counts in [0, T], with
+    zero Q/K/V beyond each count. The public dispatcher constructs these buffers.
     """
     # Builds outside the validated set are refused before anything is compiled
     # or launched: a silently wrong answer is the one failure mode this package
@@ -470,6 +489,7 @@ def kda_bt16_fwd_ascendc(
     global _LAUNCH_COUNTS, _LAUNCH_BLOCKS
     _LAUNCH_COUNTS = {}
     _LAUNCH_BLOCKS = {}
+    _LAST_PROFILE = {}
     profile = os.environ.get("KDA_PROFILE", "0") == "1"
     prof: dict[str, float] = {}
     def mark(name: str):
@@ -481,6 +501,10 @@ def kda_bt16_fwd_ascendc(
             torch.npu.synchronize()
             prof[name] = (time.perf_counter() - prof[start_name]) * 1e3
     b, t, h = _check_inputs(q, k, v, g, beta, A_log, bias, initial_state)
+    if valid_lengths is not None and (
+            valid_lengths.shape != (b,) or valid_lengths.dtype != torch.int32
+            or valid_lengths.device != q.device or not valid_lengths.is_contiguous()):
+        raise ValueError("valid_lengths must be contiguous INT32 [B] on q's NPU device")
     if out is not None and (
             out.shape != q.shape or out.dtype != torch.bfloat16
             or out.device != q.device or not out.is_contiguous()):
@@ -552,7 +576,7 @@ def kda_bt16_fwd_ascendc(
     gram_x = torch.empty((c, max(1, CHUNK // 2), D), dtype=torch.bfloat16,
                          device=q.device)
     pre_args = _pack_ptrs(pre_head + [gram_ops[0], gram_ops[1], gram_ops[2], gram_x]
-                          + pre_tail)
+                          + pre_tail + [valid_lengths])
     pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
                  _i(qk_row_bytes), _i(g_row_bytes)]
     # One MIX block pairs an AIC with two AIV subcores, so it covers

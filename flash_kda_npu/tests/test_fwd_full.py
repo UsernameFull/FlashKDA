@@ -21,9 +21,13 @@ class _TensorMetadata:
         self.dtype = tensor.dtype
         self.device = device
         self._contiguous = tensor.is_contiguous()
+        self._numel = tensor.numel()
 
     def is_contiguous(self):
         return self._contiguous
+
+    def numel(self):
+        return self._numel
 
 
 @pytest.fixture(params=["metadata", "npu"])
@@ -120,13 +124,12 @@ def test_rejects_mixed_state_dtypes(contract, initial_dtype, final_dtype):
         flash_kda.fwd(**args)
 
 
-@pytest.mark.parametrize("steps", [0, 1, 16, 32, 63, 65, 129])
-def test_rejects_unsupported_length(contract, steps):
+def test_rejects_empty_fixed_length(contract):
     args, tensor = contract
     for name in ("q", "k", "v", "g", "out"):
-        args[name] = tensor((2, steps, 2, 128))
-    args["beta"] = tensor((2, steps, 2))
-    with pytest.raises(RuntimeError, match="T >= 64 and T % 64 == 0"):
+        args[name] = tensor((2, 0, 2, 128))
+    args["beta"] = tensor((2, 0, 2))
+    with pytest.raises(RuntimeError, match="T > 0 for fixed-length"):
         flash_kda.fwd(**args)
 
 
@@ -139,11 +142,35 @@ def test_rejects_unsupported_dimension(contract):
         flash_kda.fwd(**args)
 
 
-def test_rejects_varlen(contract):
+@pytest.mark.parametrize("shape,dtype,match", [
+    ((3,), torch.int32, "must be int64"),
+    ((2, 2), torch.int64, "must be 1D"),
+    ((1,), torch.int64, "at least 2 elements"),
+])
+def test_rejects_invalid_cu_seqlens_contract(contract, shape, dtype, match):
+    args, tensor = contract
+    for name in ("q", "k", "v", "g", "out"):
+        args[name] = tensor((1, 128, 2, 128))
+    args["beta"] = tensor((1, 128, 2))
+    args["cu_seqlens"] = tensor(shape, dtype)
+    with pytest.raises(RuntimeError, match=match):
+        flash_kda.fwd(**args)
+
+
+def test_rejects_varlen_batch(contract):
     args, tensor = contract
     args["cu_seqlens"] = tensor((3,), torch.int64)
-    with pytest.raises(NotImplementedError, match="does not support cu_seqlens"):
+    with pytest.raises(RuntimeError, match="B must be 1"):
         flash_kda.fwd(**args)
+
+
+@pytest.mark.parametrize("offsets,match", [
+    ([1, 64, 128], "start at 0"), ([0, 64, 127], "end at T"),
+    ([0, 90, 64, 128], "nondecreasing"), ([0, -1, 128], "nondecreasing"),
+])
+def test_invalid_cu_seqlens_values(offsets, match):
+    with pytest.raises(RuntimeError, match=match):
+        kda_fwd._sequence_offsets(torch.tensor(offsets, dtype=torch.int64), 128)
 
 
 def test_rejects_cross_device_inputs(contract):
@@ -183,5 +210,5 @@ def test_valid_state_dispatch(contract, monkeypatch, dtype, has_in, has_out):
     assert len(calls) == 1
     # The public wrapper passes the caller's buffers through unchanged.
     assert calls[0][6] is args["out"]
-    assert calls[0][-2] is args.get("initial_state")
-    assert calls[0][-1] is args.get("final_state")
+    assert calls[0][10] is args.get("initial_state")
+    assert calls[0][11] is args.get("final_state")

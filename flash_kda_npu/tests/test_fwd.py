@@ -140,7 +140,6 @@ def test_native_configured_chunk(chunk):
     (torch.float32, torch.bfloat16), (torch.bfloat16, torch.float32),
 ])
 def test_native_rejects_mixed_state_dtypes(initial_dtype, final_dtype):
-    # The public dispatch requires multiples of 64 at every native chunk size.
     inputs = make_inputs(2, 320, 3, "npu")
     q, k, v, g, beta, a_log, bias = inputs
     initial = make_state(2, 3, 128, initial_dtype, "npu")
@@ -151,6 +150,119 @@ def test_native_rejects_mixed_state_dtypes(initial_dtype, final_dtype):
                       dt_bias=bias, lower_bound=-5.0, initial_state=initial, final_state=final)
     assert bool((final == 7).all())
     assert bool((out == 11).all())
+
+
+@pytest.mark.parametrize("steps", [1, 16, 17, 37, 63, 65, 97, 129])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("has_in,has_out", STATE_IO, ids=STATE_IDS)
+def test_native_partial_state_io(steps, state_dtype, has_in, has_out):
+    check_native(2, steps, 2, state_dtype, has_in, has_out)
+
+
+@pytest.mark.parametrize("lengths", [
+    [16], [16, 16], [4, 8, 12], [64, 128, 256], [17, 33, 65],
+    [0, 1, 0, 63, 65, 0], [64, 64], [0, 0],
+])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("has_in,has_out", STATE_IO, ids=STATE_IDS)
+def test_native_varlen_state_io(lengths, state_dtype, has_in, has_out):
+    inputs = make_inputs(1, sum(lengths), 2, "npu")
+    q, k, v, g, beta, a_log, bias = inputs
+    cu = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int64, device="npu")
+    initial = make_state(len(lengths), 2, 128, state_dtype, "npu") if has_in else None
+    saved = None if initial is None else initial.clone()
+    final = torch.full((len(lengths), 2, 128, 128), float("nan"), dtype=state_dtype,
+                       device="npu") if has_out else None
+    out = torch.full_like(q, float("nan"))
+    assert flash_kda.fwd(q, k, v, g, beta, 128 ** -0.5, out, a_log, bias, -5.0,
+                         initial_state=initial, final_state=final, cu_seqlens=cu) is None
+    torch.npu.synchronize()
+    expected_out, expected_state = recurrent_reference(inputs, saved, lengths)
+    assert_close(out, expected_out)
+    if final is not None:
+        assert_close(final, expected_state)
+    if initial is not None:
+        torch.testing.assert_close(initial, saved, rtol=0, atol=0)
+    from flash_kda_npu.ops.ascendc import CHUNK, get_last_profile
+    profile = get_last_profile()
+    if any(lengths):
+        assert profile["launch_counts"].get("kda_k2_persistent_loop", 0) >= 1
+    else:
+        assert profile["launch_total"] == 0
+    if "padded_tokens" in profile:
+        assert profile["padded_tokens"] - sum(lengths) < len(lengths) * CHUNK
+
+
+@pytest.mark.parametrize("offsets", [[1, 64, 128], [0, 64, 127], [0, 90, 64, 128]])
+def test_native_invalid_boundaries_preserve_buffers(offsets):
+    q, k, v, g, beta, a_log, bias = make_inputs(1, 128, 2, "npu")
+    out = torch.full_like(q, 11)
+    final = torch.full((len(offsets) - 1, 2, 128, 128), 7, dtype=torch.float32, device="npu")
+    cu = torch.tensor(offsets, dtype=torch.int64, device="npu")
+    with pytest.raises(RuntimeError, match="cu_seqlens must"):
+        flash_kda.fwd(q, k, v, g, beta, 128 ** -0.5, out, a_log, bias, -5.0,
+                      final_state=final, cu_seqlens=cu)
+    assert bool((out == 11).all())
+    assert bool((final == 7).all())
+
+
+@pytest.mark.parametrize("gate_value", [-8.0, 8.0])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_native_varlen_extreme_gates(gate_value, state_dtype):
+    lengths = [1, 17, 65]
+    inputs = make_inputs(1, sum(lengths), 2, "npu")
+    q, k, v, g, beta, a_log, bias = inputs
+    g.fill_(gate_value)
+    initial = make_state(3, 2, 128, state_dtype, "npu")
+    final = torch.empty_like(initial)
+    out = torch.empty_like(q)
+    cu = torch.tensor([0, 1, 18, 83], dtype=torch.int64, device="npu")
+    flash_kda.fwd(q, k, v, g, beta, 128 ** -0.5, out, a_log, bias, -5.0,
+                  initial_state=initial, final_state=final, cu_seqlens=cu)
+    expected_out, expected_state = recurrent_reference(inputs, initial, lengths)
+    assert_close(out, expected_out)
+    assert_relative_rms(final, expected_state)
+
+
+def test_native_varlen_matches_independent_sequences():
+    lengths = [17, 37, 65, 0, 17]
+    inputs = make_inputs(1, sum(lengths), 2, "npu")
+    q, k, v, g, beta, a_log, bias = inputs
+    initial = make_state(5, 2, 128, torch.float32, "npu")
+    final = torch.empty_like(initial)
+    out = torch.empty_like(q)
+    boundaries = [0, *torch.tensor(lengths).cumsum(0).tolist()]
+    cu = torch.tensor(boundaries, dtype=torch.int64, device="npu")
+    flash_kda.fwd(q, k, v, g, beta, 128 ** -0.5, out, a_log, bias, -5.0,
+                  initial_state=initial, final_state=final, cu_seqlens=cu)
+    for seq, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+        if start == end:
+            torch.testing.assert_close(final[seq], initial[seq], rtol=0, atol=0)
+            continue
+        parts = [x[:, start:end].contiguous() for x in (q, k, v, g, beta)]
+        seq_out = torch.empty_like(parts[0])
+        seq_final = torch.empty_like(initial[seq:seq + 1])
+        flash_kda.fwd(*parts, 128 ** -0.5, seq_out, a_log, bias, -5.0,
+                      initial_state=initial[seq:seq + 1], final_state=seq_final)
+        torch.testing.assert_close(out[:, start:end], seq_out, rtol=0, atol=0)
+        torch.testing.assert_close(final[seq:seq + 1], seq_final, rtol=0, atol=0)
+
+
+def test_native_varlen_long(request):
+    if not request.config.getoption("--run-long"):
+        pytest.skip("use --run-long for a long packed sequence with partial chunks")
+    lengths = [65537, 17, 63]
+    inputs = make_inputs(1, sum(lengths), 1, "npu")
+    q, k, v, g, beta, a_log, bias = inputs
+    initial = make_state(3, 1, 128, torch.float32, "npu")
+    final = torch.empty_like(initial)
+    out = torch.empty_like(q)
+    cu = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int64, device="npu")
+    flash_kda.fwd(q, k, v, g, beta, 128 ** -0.5, out, a_log, bias, -5.0,
+                  initial_state=initial, final_state=final, cu_seqlens=cu)
+    expected_out, expected_state = recurrent_reference(inputs, initial, lengths)
+    assert_close(out, expected_out)
+    assert_close(final, expected_state)
 
 
 @pytest.mark.parametrize("chunks", [1, 5, 128])
