@@ -73,7 +73,7 @@ constexpr int32_t CE = MM;        // one [M, M] block per chunk
 // stride is MM and the tile totals NCH * MM elements.
 
 extern "C" __global__ __aicore__ void kda_solve_wu_wide(
-    GM_ADDR pL, GM_ADDR pEye, GM_ADDR pA16, GM_ADDR pXb,
+    GM_ADDR pL, GM_ADDR pEye, GM_ADDR pA16,
     GM_ADDR pLneg, int32_t C) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     const int32_t c0 = GetBlockIdx() * NCH;
@@ -116,8 +116,7 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
     LocalTensor<bfloat16_t> l21b = bL21b.Get<bfloat16_t>();
     LocalTensor<float> zf = bZf.Get<float>();
     LocalTensor<bfloat16_t> zrow = bZb.Get<bfloat16_t>();
-    GlobalTensor<bfloat16_t> Xb, Lneg;
-    Xb.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pXb));
+    GlobalTensor<bfloat16_t> Lneg;
     Lneg.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pLneg));
 #endif
     L.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pL));
@@ -207,12 +206,6 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
                 static_cast<uint64_t>(c0 + ch) * PC * PC + (s * M) * PC + s * M;
             DataCopy(A16[d], ab[t * M],
                      DataCopyParams(M, M / 16, (NC - 1) * (M / 16), (PC - M) / 16));
-#if KDA_SOLVE_WIDE_SUBB > 1
-            // The same tile again, contiguous, for the coupling kernel: it
-            // reads X11 / X22 as plain [M, M] operands.
-            DataCopy(Xb[static_cast<uint64_t>(c0 + ch) * SB * MM + s * MM], ab[t * M],
-                     DataCopyParams(M, M / 16, (NC - 1) * (M / 16), 0));
-#endif
         }
     }
 #if KDA_SOLVE_WIDE_SUBB > 1

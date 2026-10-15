@@ -14,6 +14,7 @@
 //
 #include "kernel_operator.h"
 using namespace AscendC;
+namespace kda_wu {
 #ifndef KDA_CHUNK
 #define KDA_CHUNK 16
 #endif
@@ -25,9 +26,8 @@ constexpr int32_t DF = D / 16;
 #endif
 constexpr int32_t NC = KDA_WU_NCHUNK;
 
-extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
+static __aicore__ inline void run(
     GM_ADDR pA16, GM_ADDR pRk, GM_ADDR pRv, GM_ADDR pW, GM_ADDR pU, int32_t C) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
     const int32_t c0 = GetBlockIdx() * NC;
     if (c0 >= C) return;
     const int32_t nch = ((C - c0) < NC) ? (C - c0) : NC;
@@ -125,3 +125,12 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
         }
     }
 }
+}  // namespace kda_wu
+
+#ifndef KDA_SOLVE_FUSED
+extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
+    GM_ADDR pA16, GM_ADDR pRk, GM_ADDR pRv, GM_ADDR pW, GM_ADDR pU, int32_t C) {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+    kda_wu::run(pA16, pRk, pRv, pW, pU, C);
+}
+#endif

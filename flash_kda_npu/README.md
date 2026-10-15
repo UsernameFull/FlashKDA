@@ -109,12 +109,12 @@ The native path through the public API currently requires:
 - bf16 `q/k/v`, and a contiguous bf16 `out` of the same shape;
 - bf16 or fp32 `g` with shape `[B,T,H,128]`, `beta` with shape `[B,T,H]`,
   `A_log` with shape `[H]`, and `dt_bias` with shape `[H,128]`;
-- fp32 `final_state` with shape `[B,H,128,128]` when requested;
+- bf16 or fp32 `final_state` with shape `[B,H,128,128]` when requested;
 - `initial_state`, when present, with shape `[B,H,128,128]`.
 
 The wrapper makes input tensors contiguous and converts `g`, `beta`,
 `A_log`, `dt_bias`, and `initial_state` to fp32 before calling the native
-function. A noncontiguous fp32 final-state buffer is handled through a
+function. A noncontiguous final-state buffer is handled through a
 contiguous temporary and copied back. Keep all tensors on the same NPU.
 
 The public dispatch gate always checks divisibility by 64, even when
@@ -126,7 +126,7 @@ fp32 gate/beta/parameters/initial state directly and uses `bias` instead of
 
 Varlen inputs, lengths rejected by the dispatch gate, unsupported dimensions,
 and native input-validation/import failures fall back to chunked PyTorch.
-A bf16 final-state buffer also takes this fallback. RTC and launch
+RTC and launch
 `RuntimeError`s propagate rather than silently falling back. The fallback can
 run on CPU as well and uses 16-token chunks to keep inverse gates finite
 at the default lower bound.
@@ -141,6 +141,15 @@ mask/identity initialization. For native execution analysis, set `KDA_PROFILE=1`
 and inspect `flash_kda_npu.ops.ascendc.get_last_profile()` after a call.
 Profiling synchronizes the device and affects timing; leave it disabled for
 end-to-end benchmarks.
+
+Set compile options before importing `flash_kda_npu.ops.ascendc` and use a
+fresh process when changing them. RTC binaries are compiled once and loaded
+separately for each device/context. The native call selects the input tensor's
+device and restores the caller's device; all inputs must share that device.
+After resetting/destroying runtime contexts, use a fresh process.
+For chunk 64, assembly and W/U share one Cube launch per slice; assembly
+uses the W/U block's chunk count. `KDA_SOLVE_FUSE=0` restores separate
+launches for comparison. Chunk 16/32 keeps the single-level solve.
 
 ## Benchmark
 
@@ -164,8 +173,8 @@ python flash_kda_npu/benchmarks/generate_benchmark_md.py --mode fixed
 
 Varlen cases exercise the PyTorch fallback path (the native AscendC path
 requires fixed-length batches), so their timings are not comparable to
-the fixed case. The bf16-state variant also uses fallback because its final
-state is bf16; the no-state and fp32-state fixed variants can use AscendC.
+the fixed case. All three fixed-case state variants (bf16, no state, fp32)
+can use AscendC.
 The script defaults to `H=96`, 30 warmups, 200 iterations, and 5 repeats;
 `--gate-dtype` accepts `bf16` or `fp32`. The report filename/device label does
 not change the RTC hardware target.
@@ -179,7 +188,10 @@ backend and timing metadata, and Markdown reports label each variant's backend.
 
 ## Precision
 
-The native K2 recurrence keeps inter-chunk state in fp32.  Gate activation uses
+The native K2 recurrence keeps inter-chunk state in fp32, including when the
+final-state buffer is bf16. Only the final store rounds that state to bf16.
+Calls without a requested final state skip its allocation and writeback; the
+last chunk does not publish an unused intermediate state. Gate activation uses
 the FlashKDA default lower bound `-5.0`.  Numerical tests compare against the
 independent CPU fp64 token recurrence with `rtol=atol=5e-3` for outputs and
 ordinary final-state cases. Like the CUDA gate sweep, gate-extreme final states
@@ -203,9 +215,10 @@ KDA_CHUNK=32 python -m pytest -q flash_kda_npu/tests/test_fwd.py -k configured_c
 ```
 
 `test_fwd.py` covers native state input/output combinations, bf16/fp32 initial
-states and gates, batch/head mapping, gate extremes, multiple chunks, alternate
+and final states (including mixed types), gates, batch/head mapping, gate extremes, multiple chunks, alternate
 chunk sizes, and opt-in long sequences. These tests reject fallback and verify
-the persistent kernel launched. `test_fwd_full.py` checks fallback state layout,
+the persistent kernel launched. It also checks launcher ABI validation and
+device switching when two NPUs are available. `test_fwd_full.py` checks fallback state layout,
 sequence boundaries, strong decay, bf16 final states, and dispatch failure
 policy. Fallback cases run on both CPU and NPU; NPU cases are skipped on hosts
 without an NPU. Reference implementations and test helpers are in

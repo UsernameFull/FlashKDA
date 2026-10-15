@@ -5,22 +5,33 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <array>
 #include <cstdint>
 #include <cstdlib>
-#include <mutex>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace py = pybind11;
 
 namespace {
 
-std::unordered_map<std::string, aclrtFuncHandle> g_funcs;
-aclrtContext g_ctx = nullptr;
-std::mutex g_mu;
+struct Kernel {
+    aclrtFuncHandle function;
+    aclrtBinHandle binary;
+    std::string source;
+    std::vector<size_t> argSizes;
+};
+using RuntimeKey = std::pair<uintptr_t, int32_t>;
+// All entry points retain the Python GIL. Handles live for the process lifetime;
+// unloading them at interpreter shutdown can race the runtime's own teardown.
+std::map<RuntimeKey, std::unordered_map<std::string, Kernel>> g_funcs;
+std::unordered_map<std::string, std::vector<char>> g_binaries;
+constexpr size_t MAX_ARGS = 32;
 
 void Check(aclError err, const std::string &what) {
     if (err != ACL_SUCCESS) {
@@ -28,37 +39,37 @@ void Check(aclError err, const std::string &what) {
     }
 }
 
-void EnsureRt() {
-    std::lock_guard<std::mutex> lk(g_mu);
-    if (g_ctx != nullptr) {
-        return;
-    }
+RuntimeKey CurrentRuntime() {
     aclrtContext cur = nullptr;
-    aclError e = aclrtGetCurrentContext(&cur);
-    if (e != ACL_SUCCESS || cur == nullptr) {
-        e = aclInit(nullptr);
-        Check(e, "aclInit");
-        e = aclrtSetDevice(0);
-        Check(e, "aclrtSetDevice");
-        e = aclrtCreateContext(&g_ctx, 0);
-        Check(e, "aclrtCreateContext");
-        e = aclrtSetCurrentContext(g_ctx);
-        Check(e, "aclrtSetCurrentContext");
-    } else {
-        g_ctx = cur;
+    Check(aclrtGetCurrentContext(&cur), "aclrtGetCurrentContext (initialize torch.npu first)");
+    if (cur == nullptr) {
+        throw std::runtime_error("no current NPU context; initialize torch.npu first");
     }
+    int32_t device = -1;
+    Check(aclrtGetDevice(&device), "aclrtGetDevice");
+    return {reinterpret_cast<uintptr_t>(cur), device};
 }
+
+struct Program {
+    aclrtcProg value = nullptr;
+    ~Program() { if (value != nullptr) aclrtcDestroyProg(&value); }
+};
 
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("runtime_key", [] { return CurrentRuntime(); });
     m.def(
         "rtc_compile",
-        [](const std::string &src, const std::string &funcName) {
-            EnsureRt();
-            aclrtcProg prog = nullptr;
-            Check(aclrtcCreateProg(&prog, src.c_str(), funcName.c_str(), 0, nullptr, nullptr),
-                  "aclrtcCreateProg");
+        [](const std::string &src, const std::string &funcName,
+           const std::vector<size_t> &argSizes) {
+            const auto runtime = CurrentRuntime();
+            if (argSizes.empty() || argSizes.size() > MAX_ARGS) {
+                throw std::invalid_argument("kernel ABI must have 1..32 arguments");
+            }
+            for (auto size : argSizes) {
+                if (size != 4 && size != 8) throw std::invalid_argument("unsupported ABI argument size");
+            }
             // The CANN layout is <ASCEND_HOME_PATH>/<arch>-linux; derive it at
             // runtime so RTC keeps working when the toolkit is installed
             // elsewhere or on a different host architecture.
@@ -92,26 +103,44 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                     optStrs.push_back(tok);
                 }
             }
-            std::vector<const char *> options;
-            for (auto &o : optStrs) {
-                options.push_back(o.c_str());
-            }
-            aclError e = aclrtcCompileProg(prog, static_cast<int>(options.size()), options.data());
-            if (e != ACL_SUCCESS) {
-                size_t logSize = 0;
-                aclrtcGetCompileLogSize(prog, &logSize);
-                std::string log(logSize, '\0');
-                if (logSize > 0) {
-                    aclrtcGetCompileLog(prog, &log[0]);
+            std::string key = funcName + '\0' + src;
+            for (const auto &option : optStrs) key += '\0' + option;
+            auto &functions = g_funcs[runtime];
+            const auto loaded = functions.find(funcName);
+            if (loaded != functions.end()) {
+                if (loaded->second.source != key || loaded->second.argSizes != argSizes) {
+                    throw std::invalid_argument("kernel already loaded with different source/options/ABI; use a fresh process");
                 }
-                aclrtcDestroyProg(&prog);
-                throw std::runtime_error("aclrtcCompileProg failed, log:\n" + log);
+                return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(loaded->second.function));
             }
-            size_t binSize = 0;
-            Check(aclrtcGetBinDataSize(prog, &binSize), "aclrtcGetBinDataSize");
-            std::vector<char> bin(binSize);
-            Check(aclrtcGetBinData(prog, bin.data()), "aclrtcGetBinData");
-            aclrtcDestroyProg(&prog);
+            auto cached = g_binaries.find(key);
+            if (cached == g_binaries.end()) {
+                Program owner;
+                auto &prog = owner.value;
+                Check(aclrtcCreateProg(&prog, src.c_str(), funcName.c_str(), 0, nullptr, nullptr),
+                      "aclrtcCreateProg");
+                std::vector<const char *> options;
+                for (auto &o : optStrs) {
+                    options.push_back(o.c_str());
+                }
+                aclError e = aclrtcCompileProg(prog, static_cast<int>(options.size()), options.data());
+                if (e != ACL_SUCCESS) {
+                    size_t logSize = 0;
+                    aclrtcGetCompileLogSize(prog, &logSize);
+                    std::string log(logSize, '\0');
+                    if (logSize > 0) {
+                        aclrtcGetCompileLog(prog, &log[0]);
+                    }
+                    throw std::runtime_error("aclrtcCompileProg failed, log:\n" + log);
+                }
+                size_t binSize = 0;
+                Check(aclrtcGetBinDataSize(prog, &binSize), "aclrtcGetBinDataSize");
+                std::vector<char> bin(binSize);
+                Check(aclrtcGetBinData(prog, bin.data()), "aclrtcGetBinData");
+                cached = g_binaries.emplace(key, std::move(bin)).first;
+            }
+            const auto &bin = cached->second;
+            const auto binSize = bin.size();
             aclrtBinaryLoadOption opt;
             opt.type = ACL_RT_BINARY_LOAD_OPT_MAGIC;
             opt.value.magic = ACL_RT_BINARY_MAGIC_ELF_AICORE;
@@ -121,23 +150,37 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             aclrtBinHandle bh = nullptr;
             Check(aclrtBinaryLoadFromData(bin.data(), binSize, &opts, &bh), "aclrtBinaryLoadFromData");
             aclrtFuncHandle fn = nullptr;
-            Check(aclrtBinaryGetFunction(bh, funcName.c_str(), &fn), "aclrtBinaryGetFunction");
-            g_funcs[funcName] = fn;
+            const auto error = aclrtBinaryGetFunction(bh, funcName.c_str(), &fn);
+            if (error != ACL_SUCCESS) {
+                aclrtBinaryUnLoad(bh);
+                Check(error, "aclrtBinaryGetFunction");
+            }
+            functions.emplace(funcName, Kernel{fn, bh, key, argSizes});
             return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fn));
         },
-        py::arg("src"), py::arg("func_name"));
+        py::arg("src"), py::arg("func_name"), py::arg("arg_sizes"));
     m.def(
         "launch_argsarray_engine",
         [](const std::string &name, uint32_t numBlocks, uint64_t stream,
            const std::vector<std::string> &argBlobs, int32_t engine) {
-            EnsureRt();
-            auto it = g_funcs.find(name);
-            if (it == g_funcs.end()) {
-                throw std::runtime_error("kernel not loaded: " + name);
+            auto &functions = g_funcs[CurrentRuntime()];
+            auto it = functions.find(name);
+            if (it == functions.end()) {
+                throw std::runtime_error("kernel not loaded in the current device/context: " + name);
             }
-            std::vector<void *> args;
-            for (auto &b : argBlobs) {
-                args.push_back(const_cast<char *>(b.data()));
+            if (numBlocks == 0 || (engine != ACL_RT_ENGINE_TYPE_AIC && engine != ACL_RT_ENGINE_TYPE_AIV)) {
+                throw std::invalid_argument("invalid blocks or engine");
+            }
+            const auto &sizes = it->second.argSizes;
+            if (argBlobs.size() != sizes.size()) {
+                throw std::invalid_argument("kernel " + name + " expects " + std::to_string(sizes.size()) + " arguments, got " + std::to_string(argBlobs.size()));
+            }
+            std::array<void *, MAX_ARGS> args{};
+            for (size_t i = 0; i < sizes.size(); ++i) {
+                if (argBlobs[i].size() != sizes[i]) {
+                    throw std::invalid_argument("kernel " + name + " argument " + std::to_string(i) + " expects " + std::to_string(sizes[i]) + " bytes, got " + std::to_string(argBlobs[i].size()));
+                }
+                args[i] = const_cast<char *>(argBlobs[i].data());
             }
             aclrtLaunchKernelAttr attr;
             attr.id = ACL_RT_LAUNCH_KERNEL_ATTR_ENGINE_TYPE;
@@ -145,7 +188,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             aclrtLaunchKernelCfg cfg;
             cfg.attrs = &attr;
             cfg.numAttrs = 1;
-            Check(aclrtLaunchKernelWithArgsArray(it->second, numBlocks,
+            Check(aclrtLaunchKernelWithArgsArray(it->second.function, numBlocks,
                                                  reinterpret_cast<aclrtStream>(stream), &cfg,
                                                  args.data()),
                   "aclrtLaunchKernelWithArgsArray engine " + name);

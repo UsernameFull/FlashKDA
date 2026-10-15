@@ -5,6 +5,7 @@ import math
 import struct
 import os
 import time
+from functools import wraps
 from pathlib import Path
 
 import torch
@@ -16,7 +17,7 @@ EXT = PACKAGE_ROOT / "lib"
 import sys
 if str(EXT) not in sys.path:
     sys.path.insert(0, str(EXT))
-from flash_kda_npu_launcher import launch_argsarray_engine, rtc_compile
+from flash_kda_npu_launcher import launch_argsarray_engine, rtc_compile, runtime_key
 
 # Chunk size of the whole pipeline; has to match the kernels' KDA_CHUNK
 # define (see _defines).  Production builds with 64.
@@ -67,10 +68,11 @@ PERSIST_MAXH = max(1, min(4 if CHUNK <= 64 else 2,
 # Solve-Cube chunks per block: its L0C holds one slot per (pass, chunk),
 # so 4 fits up to C = 32 and 2 at C = 64 (the whole 128 KB either way).
 WU_NCHUNK = int(os.environ.get("KDA_WU_NCHUNK", "0")) or (4 if CHUNK <= 32 else 2)
+SOLVE_FUSE = SOLVE_WIDE_SUBB > 1 and os.environ.get("KDA_SOLVE_FUSE", "1") == "1"
 D = 128
 BV = 64
 NV = 2
-_COMPILED = False
+_COMPILED: set[tuple[int, int]] = set()
 _LAST_PROFILE: dict[str, object] = {}
 # Triangular 0/1 masks for the intra-chunk Gram kernel, built once per device.
 _GRAM_MASKS: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -191,16 +193,17 @@ _SOLVE_STREAMS: dict = {}
 
 
 def _solve_streams(device: torch.device):
-    pair = _SOLVE_STREAMS.get(device)
+    key = (device, runtime_key())
+    pair = _SOLVE_STREAMS.get(key)
     if pair is None:
         pair = (torch_npu.npu.Stream(device=device),
                 torch_npu.npu.Stream(device=device))
-        _SOLVE_STREAMS[device] = pair
+        _SOLVE_STREAMS[key] = pair
     return pair
 
 
 def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, eye,
-                            a16, xb, lneg, rk, rv, W, U, stream) -> None:
+                            a16, lneg, rk, rv, W, U, stream) -> None:
     """R1 two-level solve: wide kernel (AIV), then assemble + Cube (AIC).
 
     The substitution runs on M = CHUNK/SB sub-blocks (fwd_kernel1_solve_wide.cpp) and
@@ -251,27 +254,32 @@ def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, 
         sa.wait_stream(cur)
     for glo, ghi in pairs:
         lo, n = glo * unit, (ghi - glo) * unit
-        wargs = _pack_ptrs([L[lo:], eye, a16[lo:], xb[lo:], lneg[lo:]]) + [_i(n)]
-        asm_name = "kda_solve_assemble"
-        aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:]]) + [_i(n)]
-        cargs = _pack_ptrs([a16[lo:], rk[lo:], rv[lo:], W[lo:], U[lo:]]) + \
-            [_i(n)]
+        wargs = _pack_ptrs([L[lo:], eye, a16[lo:], lneg[lo:]]) + [_i(n)]
         ncube = min(n, c - lo)
+        if SOLVE_FUSE:
+            asm_name = "kda_solve_fused"
+            aargs = _pack_ptrs([a16[lo:], lneg[lo:], rk[lo:], rv[lo:], W[lo:], U[lo:]]) + [_i(ncube)]
+        else:
+            asm_name = "kda_solve_assemble"
+            aargs = _pack_ptrs([a16[lo:], lneg[lo:]]) + [_i(n)]
+            cargs = _pack_ptrs([a16[lo:], rk[lo:], rv[lo:], W[lo:], U[lo:]]) + [_i(n)]
+        asm_blocks = ((ncube + wu_nchunk - 1) // wu_nchunk if SOLVE_FUSE
+                      else (n + asm_nchunk - 1) // asm_nchunk)
         if ovl:
             _launch("kda_solve_wu_wide", n // nch, wargs, sa.npu_stream)
             ev = torch_npu.npu.Event()
             ev.record(sa)
             sb.wait_event(ev)
-            _launch(asm_name, (n + asm_nchunk - 1) // asm_nchunk,
+            _launch(asm_name, asm_blocks,
                     aargs, sb.npu_stream)
-            if ncube > 0:
+            if ncube > 0 and not SOLVE_FUSE:
                 _launch("kda_solve_wu_cube_kernel",
                         (ncube + wu_nchunk - 1) // wu_nchunk, cargs, sb.npu_stream)
         else:
             _launch("kda_solve_wu_wide", n // nch, wargs, stream)
-            _launch(asm_name, (n + asm_nchunk - 1) // asm_nchunk,
+            _launch(asm_name, asm_blocks,
                     aargs, stream)
-            if ncube > 0:
+            if ncube > 0 and not SOLVE_FUSE:
                 _launch("kda_solve_wu_cube_kernel",
                         (ncube + wu_nchunk - 1) // wu_nchunk, cargs, stream)
     if ovl:
@@ -307,40 +315,55 @@ def compile_config() -> dict[str, int]:
         "KDA_MAXH": PERSIST_MAXH,
         "KDA_SOLVE_WIDE_NCHUNK": SOLVE_WIDE_NCHUNK,
         "KDA_SOLVE_WIDE_SUBB": SOLVE_WIDE_SUBB,
-        "KDA_ASM_NCHUNK": ASM_NCHUNK,
+        "KDA_ASM_NCHUNK": WU_NCHUNK if SOLVE_FUSE else ASM_NCHUNK,
         "KDA_WU_NCHUNK": WU_NCHUNK,
         "KDA_SOLVE_OVERLAP": SOLVE_OVERLAP,
+        "KDA_SOLVE_FUSE": int(SOLVE_FUSE),
         "nv": NV,
     }
 
 
-def _rtc(rel: str, name: str) -> None:
+def _rtc(rel: str, name: str, sizes: list[int]) -> None:
     """Compile ``csrc/ascendc/<rel>`` as ``name``, defines prefix included.
 
     The source is read as ``utf-8-sig``: a UTF-8 BOM in front of the first
     ``#include`` is a hard compile error, not a warning, and is invisible in
     an editor.
     """
-    rtc_compile(_defines() + (ROOT / rel).read_text(encoding="utf-8-sig"),
-                name)
+    prefix = _defines()
+    if name == "kda_solve_fused":
+        prefix += ("#define KDA_SOLVE_FUSED 1\n#undef KDA_ASM_NCHUNK\n"
+                   "#define KDA_ASM_NCHUNK KDA_WU_NCHUNK\n")
+        sources = ("fwd_kernel1_solve_assemble.cpp", "fwd_kernel1_solve_cube.cpp",
+                   "fwd_kernel1_solve_fused.cpp")
+        source = "\n".join((PACKAGE_ROOT / "csrc/ascendc" / path).read_text(
+            encoding="utf-8-sig") for path in sources)
+    else:
+        source = (ROOT / rel).read_text(encoding="utf-8-sig")
+    rtc_compile(prefix + source, name, sizes)
 
 
-_SOURCES: list[tuple[str, str]] = [
-    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_pre_gram.cpp", "kda_pre_gram_mix"),
-    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_wide.cpp", "kda_solve_wu_wide"),
-    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_assemble.cpp", "kda_solve_assemble"),
-    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_cube.cpp", "kda_solve_wu_cube_kernel"),
-    ("flash_kda_npu/csrc/ascendc/fwd_kernel2_persistent.cpp", "kda_k2_persistent_loop"),
+_SOURCES: list[tuple[str, str, list[int]]] = [
+    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_pre_gram.cpp", "kda_pre_gram_mix", [8] * 21 + [4] * 8),
+    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_wide.cpp", "kda_solve_wu_wide", [8] * 4 + [4]),
+    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_assemble.cpp", "kda_solve_assemble", [8] * 2 + [4]),
+    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_cube.cpp", "kda_solve_wu_cube_kernel", [8] * 5 + [4]),
+    ("flash_kda_npu/csrc/ascendc/fwd_kernel2_persistent.cpp", "kda_k2_persistent_loop", [8] * 15 + [4] * 7),
 ]
+if SOLVE_FUSE:
+    _SOURCES = [entry for entry in _SOURCES if entry[1] not in (
+        "kda_solve_assemble", "kda_solve_wu_cube_kernel")]
+    _SOURCES.append(("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_fused.cpp",
+                     "kda_solve_fused", [8] * 6 + [4]))
 
 
 def _compile_all() -> None:
-    global _COMPILED
-    if _COMPILED:
+    key = runtime_key()
+    if key in _COMPILED:
         return
-    for rel, name in _SOURCES:
-        _rtc(rel, name)
-    _COMPILED = True
+    for rel, name, sizes in _SOURCES:
+        _rtc(rel, name, sizes)
+    _COMPILED.add(key)
 
 
 def _tri_masks(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -360,6 +383,9 @@ def _tri_masks(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
 def _check_inputs(q, k, v, g, beta, A_log, bias, initial_state):
     if q.device.type != "npu":
         raise ValueError("AscendC v1 requires NPU tensors")
+    if any(x is not None and x.device != q.device
+           for x in (k, v, g, beta, A_log, bias, initial_state)):
+        raise ValueError("all inputs must be on q's NPU device")
     if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
         raise TypeError("q/k/v must be BF16")
     if q.ndim != 4 or tuple(q.shape) != tuple(k.shape) or tuple(q.shape) != tuple(v.shape):
@@ -392,6 +418,17 @@ def get_last_profile() -> dict[str, object]:
     return profile
 
 
+def _on_input_device(fn):
+    @wraps(fn)
+    def run(q, *args, **kwargs):
+        if q.device.type == "npu" and q.device.index != torch_npu.npu.current_device():
+            with torch_npu.npu.device(q.device):
+                return fn(q, *args, **kwargs)
+        return fn(q, *args, **kwargs)
+    return run
+
+
+@_on_input_device
 def kda_bt16_fwd_ascendc(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -452,10 +489,10 @@ def kda_bt16_fwd_ascendc(
         if not output_final_state:
             raise ValueError("final_state requires output_final_state=True")
         if (final_state.shape != (b, h, D, D)
-                or final_state.dtype != torch.float32
+                or final_state.dtype not in (torch.float32, torch.bfloat16)
                 or final_state.device != q.device or not final_state.is_contiguous()):
             raise ValueError(
-                "final_state must be contiguous FP32 [B,H,128,128]")
+                "final_state must be contiguous FP32 or BF16 [B,H,128,128]")
     if scale is None:
         scale = D ** -0.5
     nt = t // CHUNK
@@ -482,13 +519,9 @@ def kda_bt16_fwd_ascendc(
     qg = torch.empty_like(rk); kg = torch.empty_like(rk)
     aqk32 = torch.empty((c, CHUNK, CHUNK), dtype=torch.float32, device=q.device)
     aqk16 = torch.empty((c, CHUNK, CHUNK), dtype=torch.bfloat16, device=q.device)
-    # The wide solve kernel rounds the chunk count up to SOLVE_WIDE_NCHUNK and
-    # walks whole chunk groups, so L and its two outputs are allocated with the
-    # padded length: that keeps every gather and store of the last group inside
-    # an allocation, and the values it computes for the padded chunks (never
-    # read, and never handed out below) may be whatever uninitialised device
-    # memory holds.  The debug dict hands out narrowed views so the shapes stay
-    # ``[c, 16, 16]``.
+    # Whole wiring groups include padded tail chunks. L's tail is zeroed so
+    # the wide kernel can safely solve them as identities; W/U and K2 consume
+    # only the c real chunks.
     c_solve = _solve_padded_chunks(c)
     L = torch.empty((c_solve, CHUNK, CHUNK), dtype=torch.float32, device=q.device)
     if c_solve != c:
@@ -533,26 +566,25 @@ def kda_bt16_fwd_ascendc(
     U = torch.empty_like(W)
     mark("solve_start")
     if SOLVE_WIDE_SUBB > 1:
-        # Two-level solve: the wide kernel writes the diagonal sub-blocks (Xb
-        # next to the parent tile) and the negated coupling triangle, the
+        # Two-level solve: the wide kernel writes A16's diagonal sub-blocks
+        # and the negated coupling triangle, the
         # assemble kernel forms X21 on the Cube, and the Cube solve consumes
         # the assembled tile.  See _launch_solve_two_level.
         sub = CHUNK // SOLVE_WIDE_SUBB
         bf16 = torch.bfloat16
-        xb = torch.empty((c_solve, SOLVE_WIDE_SUBB, sub, sub), dtype=bf16, device=q.device)
         # The 32-level build exports the single lower-left coupling block.
         lneg = torch.empty((c_solve, sub * sub), dtype=bf16, device=q.device)
         _launch_solve_two_level(c_solve, c, SOLVE_WIDE_NCH, ASM_NCHUNK, WU_NCHUNK,
                                 SOLVE_OVERLAP, L,
                                 _tri_eye(q.device, CHUNK // SOLVE_WIDE_SUBB),
-                                a16, xb, lneg, rk, rv, W, U, stream)
+                                a16, lneg, rk, rv, W, U, stream)
     else:
         # One AIV block solves SOLVE_WIDE_NCHUNK chunks with every vector
         # instruction (see the kernel header); the padded chunks are solved too
         # but land outside the first c.  The two-level operands are null here:
         # the kernel takes them in every build, and a short argument list would
         # leave it reading C out of the args array's tail.
-        solve_args = _pack_ptrs([L, _tri_eye(q.device), a16, None, None])
+        solve_args = _pack_ptrs([L, _tri_eye(q.device), a16, None])
         solve_args += [_i(c)]
         _launch("kda_solve_wu_wide", c_solve // SOLVE_WIDE_NCHUNK, solve_args, stream)
         # The Cube needs the bf16 A_inv the substitution just wrote, so the two
@@ -564,8 +596,8 @@ def kda_bt16_fwd_ascendc(
     finish("solve_ms", "solve_start")
 
     # One device-side chunk loop: each block owns up to MAXH heads, keeps
-    # its fp32 state in UB across all chunks and never writes S32 until
-    # the end, so the whole recurrence is a single MIX launch.  The block
+    # its fp32 state in UB across all chunks and only exports final state
+    # when requested. The whole recurrence is a single MIX launch. The block
     # count must keep the head map total: nblk * MAXH >= bh.
     aic_cores = _aic_core_count(q.device)
     # Pick the heads per block: minimize whole waves x heads, ties to the
@@ -587,9 +619,10 @@ def kda_bt16_fwd_ascendc(
     # cap *PERSIST_MAXH*, not the heads the picker chose - so a `want`
     # below the picked heads-per-block stays legal.
     nblk = max(nblk, (bh + PERSIST_MAXH - 1) // PERSIST_MAXH)
-    s32 = (final_state.view(bh, NV, BV, D).reshape(tasks, BV, D)
-           if final_state is not None else
-           torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device))
+    state_output = None
+    if output_final_state:
+        state_output = (final_state.view(tasks, BV, D) if final_state is not None
+                        else torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device))
     s16 = torch.empty((tasks, BV, D), dtype=torch.bfloat16, device=q.device)
     # d1/d2/d3 cross to the vector side as bf16 (the loop's fixpipe rounds
     # them), so they are allocated bf16: an fp32 allocation would be
@@ -612,12 +645,13 @@ def kda_bt16_fwd_ascendc(
     mark("k2_start")
     _launch("kda_k2_persistent_loop", nblk,
             _pack_ptrs([U, W, qg, aqk16, kg, decay, d1, d2, d3, d4f,
-                        out_public, vnew_t, h0, s32, s16]) +
-            [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale), _i(h)], stream)
+                        out_public, vnew_t, h0, state_output, s16]) +
+            [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale), _i(h),
+             _i(state_output is not None and state_output.dtype == torch.bfloat16)], stream)
     finish("k2_ms", "k2_start")
     final_state = None if not output_final_state else (
         final_state if final_state is not None else
-        s32.view(bh, NV, BV, D).reshape(b, h, D, D))
+        state_output.view(bh, NV, BV, D).reshape(b, h, D, D))
     if profile:
         prof["total_ms"] = sum(v for k, v in prof.items() if k.endswith("_ms"))
         _LAST_PROFILE = prof

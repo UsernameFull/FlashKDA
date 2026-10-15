@@ -143,7 +143,7 @@ def test_native_dispatch_failure_policy(monkeypatch):
 
 @pytest.mark.parametrize("device", ["cpu", "npu"])
 @pytest.mark.parametrize("gate_value", [0.0, 8.0])
-def test_bf16_final_state_fallback_strong_decay(device, gate_value):
+def test_bf16_final_state_strong_decay(device, gate_value):
     from flash_kda_npu.ops.kda_fwd import is_available
     from flash_kda_npu.tests.torch_ref import assert_close, make_inputs, recurrent_reference
     if device == "npu" and not is_available():

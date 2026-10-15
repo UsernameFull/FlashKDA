@@ -17,8 +17,8 @@
 // elements apart, which the block form of DataCopy expresses with dstGap.
 //
 // The fp32 state never leaves the AIV: it is loaded from H0 at start-up, kept
-// in UB across the whole loop and stored to S32 once at the end.  Only the bf16
-// copy of the state (S16) is published to GM for the Cube operands.
+// in UB across the whole loop, with an optional FP32/BF16 final export. Only
+// intermediate chunks publish S16 to GM for the next chunk's Cube operands.
 //
 // Each stage issues the loads that do not depend on its cross-core flag
 // *before* the wait: the two MTE2 reads of W/Qg in stage 1, the flag-free Aqk
@@ -110,8 +110,9 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
     GM_ADDR pU, GM_ADDR pW, GM_ADDR pQg, GM_ADDR pAqk, GM_ADDR pKgT, GM_ADDR pDecay,
     GM_ADDR pD1, GM_ADDR pD2, GM_ADDR pD3, GM_ADDR pD4,
     GM_ADDR pOut, GM_ADDR pVnewT,
-    GM_ADDR pH0, GM_ADDR pS32, GM_ADDR pS16,
-    int32_t BH, int32_t NT, int32_t NV, int32_t NBLK, float scale, int32_t NH) {
+    GM_ADDR pH0, GM_ADDR pFinal, GM_ADDR pS16,
+    int32_t BH, int32_t NT, int32_t NV, int32_t NBLK, float scale, int32_t NH,
+    int32_t finalBF16) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     const int32_t nv = NV;
 
@@ -384,8 +385,8 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         for (int32_t h = blk; h < BH && nh < MAXH; h += NBLK) heads[nh++] = h;
         if (nh == 0) return;
 
-        GlobalTensor<bfloat16_t> U, Vt, S16, Out;
-        GlobalTensor<float> D4, Decay, H0, S32;
+        GlobalTensor<bfloat16_t> U, Vt, S16, Out, Final16;
+        GlobalTensor<float> D4, Decay, H0, Final32;
         GlobalTensor<bfloat16_t> D1, D2, D3;
         U.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pU));
         Vt.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pVnewT));
@@ -397,7 +398,8 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         Decay.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pDecay));
         Out.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pOut));
         H0.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pH0));
-        S32.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pS32));
+        Final32.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pFinal));
+        Final16.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pFinal));
 
         TPipe pipe;
         TEventID e2v = pipe.AllocEventID<HardEvent::MTE2_V>();
@@ -583,6 +585,8 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 // as whole rows.  Each next quarter's load and its MTE2->V
                 // wait hide behind the current quarter's vector work exactly
                 // as the two halves did.
+                const bool nextChunk = chunk + 1 < NT;
+                const bool publish = nextChunk || (pFinal != nullptr && finalBF16);
                 for (int32_t hf = 0; hf < 4; ++hf) {
                     if (hf > 0) {
                         WaitFlag<HardEvent::MTE2_V>(e2v);
@@ -592,14 +596,14 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                         // PipeBarrier<PIPE_MTE3> does NOT provide (it only
                         // orders MTE3 against MTE3), so it needs the event
                         // pair.
-                        WaitFlag<HardEvent::MTE3_V>(e3v);
+                        if (publish) WaitFlag<HardEvent::MTE3_V>(e3v);
                     }
                     LocalTensor<float> sh = state[hf * (S_TILE / 4)];
                     Mul(sh, sh, dec, 64, BV / 4, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
                     Mul(sh[64], sh[64], dec[64], 64, BV / 4, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
                     Add(sh, sh, d4, S_TILE / 4);
                     PipeBarrier<PIPE_V>();
-                    Cast(s16, sh, RoundMode::CAST_RINT, S_TILE / 4);
+                    if (publish) Cast(s16, sh, RoundMode::CAST_RINT, S_TILE / 4);
                     PipeBarrier<PIPE_V>();
                     SetFlag<HardEvent::V_MTE3>(ev3);
                     WaitFlag<HardEvent::V_MTE3>(ev3);
@@ -614,12 +618,18 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                                  DataCopyParams(M, BV / 16, 0,
                                                 static_cast<uint16_t>(NH * D / 16 - BV / 16)));
                     }
-                    DataCopy(S16[static_cast<uint64_t>(task) * S_TILE + hf * (BV / 4) * D], s16,
-                             DataCopyParams(BV / 4, D / 16, 0, 0));
+                    if (publish) {
+                        const uint64_t offset = static_cast<uint64_t>(task) * S_TILE + hf * (BV / 4) * D;
+                        if (nextChunk) {
+                            DataCopy(S16[offset], s16, DataCopyParams(BV / 4, D / 16, 0, 0));
+                        } else {
+                            DataCopy(Final16[offset], s16, DataCopyParams(BV / 4, D / 16, 0, 0));
+                        }
+                    }
                     if (hf < 3) {
                         // ... and release the buffer for the next quarter once
                         // this store has actually read it.
-                        SetFlag<HardEvent::MTE3_V>(e3v);
+                        if (publish) SetFlag<HardEvent::MTE3_V>(e3v);
                         SetFlag<HardEvent::V_MTE2>(evm2);
                         WaitFlag<HardEvent::V_MTE2>(evm2);
                         DataCopy(d4, D4[d4base + (hf + 1) * (BV / 4) * D],
@@ -627,14 +637,14 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                         SetFlag<HardEvent::MTE2_V>(e2v);
                     }
                 }
-                CrossCoreSetFlag<2, PIPE_MTE3>(FL_R);
+                if (nextChunk) CrossCoreSetFlag<2, PIPE_MTE3>(FL_R);
             }
         }
         SetFlag<HardEvent::V_MTE3>(ev3);
         WaitFlag<HardEvent::V_MTE3>(ev3);
-        for (int32_t s = 0; s < nh; ++s) {
+        for (int32_t s = 0; pFinal != nullptr && !finalBF16 && s < nh; ++s) {
             const int32_t task = heads[s] * nv + iv;
-            DataCopy(S32[static_cast<uint64_t>(task) * S_TILE], st[s * S_TILE],
+            DataCopy(Final32[static_cast<uint64_t>(task) * S_TILE], st[s * S_TILE],
                      DataCopyParams(BV, D / 8, 0, 0));
         }
         PipeBarrier<PIPE_ALL>();

@@ -9,7 +9,7 @@
 //   A_inv = [[X11, 0], [-X22 L21 X11, X22]]
 //
 // which holds for I + L split as [[I+L11, 0], [L21, I+L22]] with L strictly
-// lower.  X11/X22 arrive in Xb, and Lneg21 is the negated bf16 export.  This
+// lower.  X11/X22 are read directly from A16; Lneg21 is the negated bf16 export. This
 // kernel's output is the only writer of the parent tile's lower-left block;
 // the wide kernel writes its diagonal and zeroes its strict upper triangle
 // (the Cube solve reads all of it).
@@ -20,6 +20,7 @@
 // Fixpipe call after the chunk loop.
 #include "kernel_operator.h"
 using namespace AscendC;
+namespace kda_assembly {
 
 #ifndef KDA_CHUNK
 #define KDA_CHUNK 64
@@ -37,9 +38,7 @@ constexpr int32_t PASSES = 2;
 constexpr int32_t LBSZ = MM * 2;   // one [M, M] bf16 operand
 constexpr int32_t SLOTS = PASSES * NC;  // one L0 slot per (pass, chunk) unit
 
-// One chunk's L0 chain and store, shared by both load paths.  `defer_pass1`
-// suppresses pass 1's A16 store when the caller batches the block's four
-// lower-left stores after the chunk loop.
+// One chunk's L0 chain. Pass 1's lower-left stores are batched by the caller.
 static __aicore__ inline void assemble_chunk(
     int32_t pass, int32_t slot,
     LocalTensor<bfloat16_t> la, LocalTensor<bfloat16_t> lb,
@@ -79,11 +78,7 @@ static __aicore__ inline void assemble_chunk(
     Mmad(cf, a, b, MmadParams(M, M, M, 0, false, true));
     SetFlag<HardEvent::M_FIX>(emf);
     WaitFlag<HardEvent::M_FIX>(emf);
-    // Pass 0 writes the intermediate row-major; pass 1 writes the parent
-    // tile's lower-left block, whose rows are PC elements apart instead of M.
-    auto ip = FixpipeParamsV220(M, M, M, (pass == 0) ? M : PC, false);
-    ip.quantPre = QuantMode_t::F322BF16;
-    ip.unitFlag = 0;
+    // Pass 0 keeps the BF16 intermediate in L1 NZ layout.
     if (pass == 0) {
         auto ipnz = FixpipeParamsV220(M, M, M, M, false);
         ipnz.quantPre = QuantMode_t::F322BF16;
@@ -93,9 +88,8 @@ static __aicore__ inline void assemble_chunk(
     // Pass 1's A16 stores are batched after the chunk loop.
 }
 
-extern "C" __global__ __aicore__ void kda_solve_assemble(
-    GM_ADDR pA16, GM_ADDR pXb, GM_ADDR pLneg, int32_t C) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+static __aicore__ inline void run(
+    GM_ADDR pA16, GM_ADDR pLneg, int32_t C) {
     const int32_t c0 = GetBlockIdx() * NC;
     if (c0 >= C) return;
     const int32_t nch = ((C - c0) < NC) ? (C - c0) : NC;
@@ -114,21 +108,24 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
     LocalTensor<float> cfall(TPosition::CO1, 0, SLOTS * MM);
     LocalTensor<uint8_t> a8(TPosition::A2, 0, SLOTS * MM * 2);
     LocalTensor<uint8_t> b8(TPosition::B2, 0, SLOTS * MM * 2);
-    GlobalTensor<bfloat16_t> A16, Xb, Lneg;
+    GlobalTensor<bfloat16_t> A16, Lneg;
     A16.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pA16));
-    Xb.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pXb));
     Lneg.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pLneg));
     LocalTensor<bfloat16_t> laAll = bufA.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> lpAll = bufP.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> lxAll = bufX.Get<bfloat16_t>();
 
-    // Both passes' Xb operands in one call: 4*nch ND matrices of 16 rows at
-    // the uniform band stride.  Band 0 of a chunk's window is pass 0's B
-    // (read with LoadDataWithTranspose) and band 1 is pass 1's A.
+    // Keep the existing band-major L1 layout while gathering the two
+    // diagonal blocks from their strided rows in the parent A16 tile.
     DataCopy(laAll, Lneg[static_cast<uint64_t>(c0) * MM],
              Nd2NzParams(nch, M, M, MM, M, M, 1, MM));
-    DataCopy(lxAll, Xb[static_cast<uint64_t>(c0) * 2 * MM],
-             Nd2NzParams(4 * nch, 16, M, BANDE, M, 16, 1, BANDE));
+    for (int32_t ch = 0; ch < nch; ++ch) {
+        for (int32_t diag = 0; diag < 2; ++diag) {
+            DataCopy(lxAll[ch * 2 * MM + diag * MM],
+                     A16[static_cast<uint64_t>(c0 + ch) * PC * PC + diag * (M * PC + M)],
+                     Nd2NzParams(KF, 16, M, 16 * PC, PC, 16, 1, BANDE));
+        }
+    }
     SetFlag<HardEvent::MTE2_MTE1>(e21);
     WaitFlag<HardEvent::MTE2_MTE1>(e21);
     for (int32_t pass = 0; pass < PASSES; ++pass) {
@@ -158,3 +155,12 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
     }
     PipeBarrier<PIPE_ALL>();
 }
+}  // namespace kda_assembly
+
+#ifndef KDA_SOLVE_FUSED
+extern "C" __global__ __aicore__ void kda_solve_assemble(
+    GM_ADDR pA16, GM_ADDR pLneg, int32_t C) {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+    kda_assembly::run(pA16, pLneg, C);
+}
+#endif
