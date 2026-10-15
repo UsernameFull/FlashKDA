@@ -6,7 +6,7 @@ from torch.nn import functional as F
 
 from flash_kda_npu import fwd as npu_fwd
 from flash_kda_npu.ops.kda_fwd import is_available
-from tests.flashkda_reference import flashkda_reference_forward
+from flash_kda_npu.tests.flashkda_reference import flashkda_reference_forward
 
 
 requires_npu = pytest.mark.skipif(
