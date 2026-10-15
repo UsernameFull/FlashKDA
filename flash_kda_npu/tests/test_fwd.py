@@ -1,4 +1,4 @@
-"""Native AscendC coverage; fallback is a failure, never a passing test."""
+"""Native AscendC accuracy and launcher coverage."""
 import pytest
 import torch
 
@@ -9,13 +9,6 @@ from flash_kda_npu.tests.torch_ref import (
 )
 
 pytestmark = pytest.mark.skipif(not kda_fwd.is_available(), reason="requires an Ascend NPU")
-
-
-@pytest.fixture
-def native_only(monkeypatch):
-    def refuse_fallback(*args, **kwargs):
-        pytest.fail("native case unexpectedly selected the PyTorch fallback")
-    monkeypatch.setattr(kda_fwd, "_torch_fallback", refuse_fallback)
 
 
 def check_native(batch, steps, heads, state_dtype=torch.float32,
@@ -30,11 +23,20 @@ def check_native(batch, steps, heads, state_dtype=torch.float32,
                        device="npu") if has_out else None
     out = torch.full_like(inputs[2], float("nan"))
     q, k, v, g, beta, a_log, bias = inputs
-    result = flash_kda.fwd(q, k, v, g, beta, 128 ** -0.5, out,
-                           A_log=a_log, dt_bias=bias, lower_bound=lower_bound,
-                           initial_state=initial, final_state=final)
+    if gate_dtype == torch.bfloat16:
+        result = flash_kda.fwd(q, k, v, g, beta, 128 ** -0.5, out,
+                              A_log=a_log, dt_bias=bias, lower_bound=lower_bound,
+                              initial_state=initial, final_state=final)
+        assert result is None
+    else:
+        # The lower-level interface accepts FP32 gates; CUDA's public API does not.
+        from flash_kda_npu.ops.ascendc import kda_bt16_fwd_ascendc
+        kda_bt16_fwd_ascendc(
+            q, k, v, g, beta.float(), scale=128 ** -0.5, out=out,
+            A_log=a_log, bias=bias, lower_bound=lower_bound,
+            initial_state=None if initial is None else initial.float(),
+            output_final_state=final is not None, final_state=final)
     torch.npu.synchronize()
-    assert result is None
     from flash_kda_npu.ops.ascendc import get_last_profile
     assert get_last_profile()["launch_counts"].get("kda_k2_persistent_loop", 0) == 1
     expected_out, expected_state = recurrent_reference(inputs, saved_initial, lower_bound=lower_bound)
@@ -53,23 +55,23 @@ def check_native(batch, steps, heads, state_dtype=torch.float32,
 @pytest.mark.parametrize("has_in,has_out", STATE_IO, ids=STATE_IDS)
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("batch,steps,heads", [(1, 64, 1), (1, 256, 4), (2, 128, 4)])
-def test_native_state_io(native_only, batch, steps, heads, state_dtype, has_in, has_out):
+def test_native_state_io(batch, steps, heads, state_dtype, has_in, has_out):
     check_native(batch, steps, heads, state_dtype, has_in, has_out)
 
 
 @pytest.mark.parametrize("heads", [1, 4, 32, 96])
-def test_native_head_mapping(native_only, heads):
+def test_native_head_mapping(heads):
     check_native(1, 64, heads)
 
 
 @pytest.mark.parametrize("batch,steps,heads", [(4, 256, 1), (8, 128, 4)])
-def test_native_batched(native_only, batch, steps, heads):
+def test_native_batched(batch, steps, heads):
     check_native(batch, steps, heads)
 
 
 @pytest.mark.parametrize("unroll", [1, 3, 8])
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_native_head_parameters(native_only, monkeypatch, unroll, with_bias):
+def test_native_head_parameters(monkeypatch, unroll, with_bias):
     """Refresh cached metadata across heads, batches and the padded tail."""
     from flash_kda_npu.ops.ascendc import CHUNK, kda_bt16_fwd_ascendc
     monkeypatch.setenv("KDA_PRE_UNROLL", str(unroll))
@@ -89,7 +91,7 @@ def test_native_head_parameters(native_only, monkeypatch, unroll, with_bias):
 
 
 @pytest.mark.parametrize("blocks", [1, 2, 4])
-def test_native_reused_handoff_slots(native_only, monkeypatch, blocks):
+def test_native_reused_handoff_slots(monkeypatch, blocks):
     """Exercise repeated handoffs with one, two or four heads per block."""
     monkeypatch.setenv("KDA_PERSIST_LOOP_BLOCKS", str(blocks))
     check_native(1, 512, 4, gate_dtype=torch.float32)
@@ -98,29 +100,29 @@ def test_native_reused_handoff_slots(native_only, monkeypatch, blocks):
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("gate_value", [-8.0, -4.0, 0.0, 8.0])
-def test_native_gate_sweep(native_only, state_dtype, gate_dtype, gate_value):
+def test_native_gate_sweep(state_dtype, gate_dtype, gate_value):
     check_native(1, 128, 2, state_dtype=state_dtype, gate_dtype=gate_dtype, gate_value=gate_value)
 
 
 @pytest.mark.parametrize("lower_bound", [-1.0, -3.0])
-def test_native_lower_bound(native_only, lower_bound):
+def test_native_lower_bound(lower_bound):
     check_native(1, 128, 2, lower_bound=lower_bound)
 
 
 @pytest.mark.parametrize("steps", [1024, 8192])
-def test_native_multichunk(native_only, steps):
+def test_native_multichunk(steps):
     check_native(1, steps, 1)
 
 
 @pytest.mark.parametrize("steps", [131072, 1048576])
-def test_native_long(native_only, request, steps):
+def test_native_long(request, steps):
     if not request.config.getoption("--run-long"):
         pytest.skip("use --run-long for the CUDA-scale long-sequence cases")
     check_native(1, steps, 1)
 
 
 @pytest.mark.parametrize("chunk", [16, 32, 64])
-def test_native_configured_chunk(native_only, chunk):
+def test_native_configured_chunk(chunk):
     from flash_kda_npu.ops.ascendc import CHUNK, kda_bt16_fwd_ascendc
     if CHUNK != chunk:
         pytest.skip(f"requires a fresh process with KDA_CHUNK={chunk}")
@@ -137,23 +139,22 @@ def test_native_configured_chunk(native_only, chunk):
 @pytest.mark.parametrize("initial_dtype,final_dtype", [
     (torch.float32, torch.bfloat16), (torch.bfloat16, torch.float32),
 ])
-def test_native_mixed_state_dtypes(native_only, initial_dtype, final_dtype):
+def test_native_rejects_mixed_state_dtypes(initial_dtype, final_dtype):
     # The public dispatch requires multiples of 64 at every native chunk size.
     inputs = make_inputs(2, 320, 3, "npu")
     q, k, v, g, beta, a_log, bias = inputs
     initial = make_state(2, 3, 128, initial_dtype, "npu")
-    final = torch.empty_like(initial, dtype=final_dtype)
-    out = torch.empty_like(q)
-    flash_kda.fwd(q, k, v, g, beta, 128 ** -0.5, out, A_log=a_log,
-                  dt_bias=bias, lower_bound=-5.0, initial_state=initial, final_state=final)
-    torch.npu.synchronize()
-    expected_out, expected_state = recurrent_reference(inputs, initial)
-    assert_close(out, expected_out)
-    assert_close(final, expected_state)
+    final = torch.full_like(initial, 7, dtype=final_dtype)
+    out = torch.full_like(q, 11)
+    with pytest.raises(RuntimeError, match="must have the same dtype"):
+        flash_kda.fwd(q, k, v, g, beta, 128 ** -0.5, out, A_log=a_log,
+                      dt_bias=bias, lower_bound=-5.0, initial_state=initial, final_state=final)
+    assert bool((final == 7).all())
+    assert bool((out == 11).all())
 
 
 @pytest.mark.parametrize("chunks", [1, 5, 128])
-def test_native_final_state_rounding(native_only, chunks):
+def test_native_final_state_rounding(chunks):
     from flash_kda_npu.ops.ascendc import CHUNK, kda_bt16_fwd_ascendc
     q, k, v, g, beta, a_log, bias = make_inputs(
         1, CHUNK * chunks, 2, "npu", gate_dtype=torch.float32)
@@ -198,7 +199,7 @@ def test_launcher_cache_identity():
         rtc_compile(source + "\n// changed source", name, sizes)
 
 
-def test_native_device_switch(native_only):
+def test_native_device_switch():
     if torch.npu.device_count() < 2:
         pytest.skip("requires two NPU devices")
     from flash_kda_npu.ops.ascendc import CHUNK, _COMPILED, kda_bt16_fwd_ascendc

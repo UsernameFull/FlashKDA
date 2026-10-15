@@ -93,9 +93,10 @@ flash_kda.fwd(
 )
 ```
 
-`flash_kda.fwd` sends non-CUDA tensors to `flash_kda_npu.ops.fwd`.  On NPU it
-first checks whether the native AscendC path can run and otherwise falls back to
-the chunked PyTorch implementation.
+`flash_kda.fwd` sends non-CUDA tensors to `flash_kda_npu.ops.fwd`. The NPU
+entry point executes native AscendC only, with no automatic PyTorch fallback.
+CPU inputs are rejected. Validation, import, RTC compilation and kernel launch
+errors propagate to the caller, as on the CUDA path.
 
 The public API writes `out` and the optional `final_state` in place and returns
 `None`. Q/K are normalized internally; pass raw gate values and beta logits,
@@ -106,16 +107,18 @@ The native path through the public API currently requires:
 - NPU tensors with matching `q/k/v` shape `[B,T,H,128]`, `T >= 64`,
   and `T % 64 == 0`;
 - fixed-length batches (`cu_seqlens is None`);
-- bf16 `q/k/v`, and a contiguous bf16 `out` of the same shape;
-- bf16 or fp32 `g` with shape `[B,T,H,128]`, `beta` with shape `[B,T,H]`,
-  `A_log` with shape `[H]`, and `dt_bias` with shape `[H,128]`;
+- bf16 `q/k/v/g/out` of the same shape, and bf16 `beta` with shape `[B,T,H]`;
+- fp32 `A_log` with shape `[H]` and fp32 `dt_bias` with shape `[H,128]`;
 - bf16 or fp32 `final_state` with shape `[B,H,128,128]` when requested;
-- `initial_state`, when present, with shape `[B,H,128,128]`.
+- bf16 or fp32 `initial_state`, when present, with shape `[B,H,128,128]`;
+- matching initial/final state dtypes when both buffers are supplied, as on CUDA;
+- all tensors contiguous and on the same NPU, with positive batch/head counts.
 
-The wrapper makes input tensors contiguous and converts `g`, `beta`,
-`A_log`, `dt_bias`, and `initial_state` to fp32 before calling the native
-function. A noncontiguous final-state buffer is handled through a
-contiguous temporary and copied back. Keep all tensors on the same NPU.
+The wrapper validates public inputs before any conversion or native launch.
+It converts the validated bf16 `g`/`beta` and optional initial state to fp32
+for the internal AscendC interface. It does not repair noncontiguous inputs,
+silently accept other public dtypes, or copy through a temporary final-state
+buffer. The caller's output buffers are passed directly to AscendC.
 
 The public dispatch gate always checks divisibility by 64, even when
 `KDA_CHUNK` is 16 or 32. The lower-level
@@ -124,12 +127,11 @@ by the configured chunk size and returns `(out, final_state)`; it requires
 fp32 gate/beta/parameters/initial state directly and uses `bias` instead of
 `dt_bias`.
 
-Varlen inputs, lengths rejected by the dispatch gate, unsupported dimensions,
-and native input-validation/import failures fall back to chunked PyTorch.
-RTC and launch
-`RuntimeError`s propagate rather than silently falling back. The fallback can
-run on CPU as well and uses 16-token chunks to keep inverse gates finite
-at the default lower bound.
+The public dtype, state-buffer and failure contracts match CUDA. Native shape
+coverage is still narrower: CUDA supports varlen and partial chunks; NPU
+currently raises `NotImplementedError` for NPU `cu_seqlens` and `RuntimeError`
+for unsupported lengths or dimensions. Public tensor validation failures raise
+`RuntimeError`; exceptions from the native implementation retain their types.
 
 ## Configuration and profiling
 
@@ -155,7 +157,7 @@ launches for comparison. Chunk 16/32 keeps the single-level solve.
 
 `benchmarks/` mirrors the CUDA suite's structure: `bench.sh` sources CANN,
 installs the package and runs `bench_fwd.py` (three state variants, fixed
-and varlen cases, `torch.npu.Event` timing); `generate_benchmark_md.py`
+cases, `torch.npu.Event` timing); `generate_benchmark_md.py`
 runs it twice (default `H` and `--H 64`) and writes `BENCHMARK_A3.md`.
 
 ```bash
@@ -164,26 +166,27 @@ bash flash_kda_npu/benchmarks/bench.sh
 bash flash_kda_npu/benchmarks/bench.sh --mode fixed --H 96
 # Require native execution, using an fp32 initial/final state:
 bash flash_kda_npu/benchmarks/bench.sh --mode fixed --state fp32 --require-native
-# Short fixed/varlen smoke run, with machine-readable timings:
+# Short native smoke run, with machine-readable timings:
 python flash_kda_npu/benchmarks/bench_fwd.py --T 128 --H 4 \
-    --seq-lens 17 33 65 --warmup 1 --iters 2 --repeats 1 --json /tmp/npu-bench.json
+    --warmup 1 --iters 2 --repeats 1 --json /tmp/npu-bench.json
 # Generate BENCHMARK_A3.md (after installation and CANN setup):
 python flash_kda_npu/benchmarks/generate_benchmark_md.py --mode fixed
 ```
 
-Varlen cases exercise the PyTorch fallback path (the native AscendC path
-requires fixed-length batches), so their timings are not comparable to
-the fixed case. All three fixed-case state variants (bf16, no state, fp32)
-can use AscendC.
+Fixed-length mode is the default. Varlen selectors and unsupported dimensions
+or lengths produce an explicit error rather than a fallback benchmark.
+All three state variants (bf16, no state, fp32) execute AscendC.
 The script defaults to `H=96`, 30 warmups, 200 iterations, and 5 repeats;
-`--gate-dtype` accepts `bf16` or `fp32`. The report filename/device label does
+`--gate-dtype` accepts `bf16`, matching the CUDA public contract.
+`--require-native` remains accepted for compatibility; native execution is
+always required. The report filename/device label does
 not change the RTC hardware target.
 
 State conversion and buffer allocation are outside the timed callable. Each
-variant reports the observed backend (`ascendc` or `torch_fallback`), device-event
+variant reports the backend (`ascendc`), device-event
 latency, and mean wall latency per call. An untimed preflight checks that outputs
 and requested final states are finite. `--state` selects one state variant;
-`--T` and `--seq-lens` override fixed and varlen lengths. JSON output preserves
+`--T` overrides the fixed sequence length. JSON output preserves
 backend and timing metadata, and Markdown reports label each variant's backend.
 
 ## Precision
@@ -215,12 +218,16 @@ KDA_CHUNK=32 python -m pytest -q flash_kda_npu/tests/test_fwd.py -k configured_c
 ```
 
 `test_fwd.py` covers native state input/output combinations, bf16/fp32 initial
-and final states (including mixed types), gates, batch/head mapping, gate extremes, multiple chunks, alternate
-chunk sizes, and opt-in long sequences. These tests reject fallback and verify
+and final states, rejection of mixed state types, gates, batch/head mapping,
+gate extremes, multiple chunks, alternate chunk sizes, and opt-in long
+sequences. These tests verify
 the persistent kernel launched. It also checks launcher ABI validation and
-device switching when two NPUs are available. `test_fwd_full.py` checks fallback state layout,
-sequence boundaries, strong decay, bf16 final states, and dispatch failure
-policy. Fallback cases run on both CPU and NPU; NPU cases are skipped on hosts
-without an NPU. Reference implementations and test helpers are in
+device switching when two NPUs are available. `test_fwd_full.py` checks the
+public tensor contract, unsupported shapes, state dtype consistency, buffer
+identity and exception propagation. Contract tests run with metadata doubles
+on CPU hosts and with real NPU tensors when available; native numerical tests
+are skipped on hosts without an NPU. The lower-level tests also cover FP32
+gates, which are internal to AscendC rather than public API inputs.
+Reference implementations and test helpers are in
 `tests/torch_ref.py`. As with the CUDA suite, tests are run from a repository
 checkout rather than installed as part of the package.

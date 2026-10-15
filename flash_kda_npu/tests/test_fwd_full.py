@@ -1,159 +1,187 @@
-import math
+"""CUDA-compatible public validation and native-only failure policy.
+
+Metadata doubles exercise dispatch on CPU hosts. The same contract cases also
+run with real NPU tensors; numerical kernel coverage lives in test_fwd.py.
+"""
+from types import SimpleNamespace
 
 import pytest
 import torch
-from torch.nn import functional as F
 
-from flash_kda_npu import fwd as npu_fwd
-from flash_kda_npu.ops.kda_fwd import _activate_gate
-
-
-def _make_inputs(length, heads, dim=128):
-    torch.manual_seed(42)
-    q = F.normalize(
-        torch.randn((1, length, heads, dim), dtype=torch.float32), dim=-1
-    ).to(torch.bfloat16)
-    k = F.normalize(
-        torch.randn((1, length, heads, dim), dtype=torch.float32), dim=-1
-    ).to(torch.bfloat16)
-    v = torch.randn((1, length, heads, dim), dtype=torch.bfloat16)
-    g = torch.randn((1, length, heads, dim), dtype=torch.bfloat16)
-    beta = torch.randn((1, length, heads), dtype=torch.bfloat16)
-    A_log = torch.rand(heads, dtype=torch.float32)
-    dt_bias = torch.rand(heads, dim, dtype=torch.float32)
-    return q, k, v, g, beta, A_log, dt_bias
+import flash_kda
+from flash_kda_npu.ops import kda_fwd
 
 
-def test_npu_fallback_one_token_state_update():
-    length, heads = 1, 2
-    q, k, v, g, beta, A_log, dt_bias = _make_inputs(length, heads)
-    out = torch.zeros_like(v)
-    final_state = torch.zeros(1, heads, 128, 128, dtype=torch.float32)
+class _TensorMetadata:
+    is_cuda = False
 
-    npu_fwd(
-        q, k, v, g, beta, 1.0 / math.sqrt(128), out,
-        A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0,
-        final_state=final_state,
-    )
+    def __init__(self, tensor, device):
+        self.shape = tensor.shape
+        self.ndim = tensor.ndim
+        self.dtype = tensor.dtype
+        self.device = device
+        self._contiguous = tensor.is_contiguous()
 
-    beta_activated = torch.sigmoid(beta.float()).to(torch.bfloat16)
-    query_key = (q.float() * k.float()).sum(-1, keepdim=True) * (1.0 / math.sqrt(128))
-    expected_out = query_key * (v.float() * beta_activated.unsqueeze(-1).float())
-    expected_out = expected_out.to(torch.bfloat16)
-    gate = _activate_gate(g, A_log, dt_bias, -5.0)
-    k_restored = (
-        k[0, 0]
-        * torch.special.exp2(-gate[0, 0]).to(torch.bfloat16)
-        * torch.special.exp2(gate[0, 0]).to(torch.bfloat16)
-    )
-    expected_state = torch.stack(
-        [k_restored[head].float().unsqueeze(1)
-         @ (v[0, 0, head].float() * beta_activated[0, 0, head].float()).unsqueeze(0)
-         for head in range(heads)]
-    ).transpose(-1, -2).unsqueeze(0)
-    torch.testing.assert_close(out, expected_out, rtol=5e-3, atol=5e-3)
-    torch.testing.assert_close(
-        final_state, expected_state.float(), rtol=5e-3, atol=5e-3
-    )
+    def is_contiguous(self):
+        return self._contiguous
 
 
-@pytest.mark.parametrize("seq_lens", [[1, 2], [3, 1]])
-def test_npu_fallback_varlen(seq_lens):
-    length = sum(seq_lens)
-    heads = 2
-    q, k, v, g, beta, A_log, dt_bias = _make_inputs(length, heads)
-    out = torch.zeros_like(v)
-    final_state = torch.zeros(len(seq_lens), heads, 128, 128, dtype=torch.float32)
-    cu_seqlens = torch.tensor([0, *torch.tensor(seq_lens).cumsum(0)], dtype=torch.long)
-
-    npu_fwd(
-        q, k, v, g, beta, 1.0 / math.sqrt(128), out,
-        A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0,
-        final_state=final_state, cu_seqlens=cu_seqlens,
-    )
-
-    beta_activated = torch.sigmoid(beta.float()).to(torch.bfloat16)
-    for sequence, token in enumerate(cu_seqlens[:-1]):
-        query = q[0, token].float()
-        key = k[0, token].float()
-        query_key = (query * key).sum(-1, keepdim=True) * (1.0 / math.sqrt(128))
-        expected = query_key * (
-            v[0, token].float() * beta_activated[0, token].unsqueeze(-1).float()
-        )
-        torch.testing.assert_close(out[0, token], expected.to(torch.bfloat16),
-                                   rtol=5e-3, atol=5e-3)
-
-
-def test_npu_fallback_supports_other_dimension():
-    q, k, v, g, beta, A_log, dt_bias = _make_inputs(1, 1, dim=4)
-    out = torch.zeros_like(v)
-
-    npu_fwd(
-        q, k, v, g, beta, 0.5, out,
-        A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0,
-    )
-
-    assert out.shape == v.shape
-
-
-@pytest.mark.parametrize("device", ["cpu", "npu"])
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("has_in,has_out", [(True, True), (True, False), (False, True), (False, False)])
-@pytest.mark.parametrize("batch,lengths", [(1, [17]), (1, [17, 33, 65]), (2, [37, 37])])
-def test_fallback_recurrence(device, state_dtype, has_in, has_out, batch, lengths):
-    from flash_kda_npu.ops.kda_fwd import is_available
-    from flash_kda_npu.tests.torch_ref import assert_close, make_inputs, make_state, recurrent_reference
-    if device == "npu" and not is_available():
+@pytest.fixture(params=["metadata", "npu"])
+def contract(request, monkeypatch):
+    real_npu = request.param == "npu"
+    if real_npu and not kda_fwd.is_available():
         pytest.skip("requires an Ascend NPU")
-    steps = sum(lengths) if batch == 1 else lengths[0]
-    inputs = make_inputs(batch, steps, 2, device)
-    initial = make_state(len(lengths), 2, 128, state_dtype, device) if has_in else None
-    final = torch.full((len(lengths), 2, 128, 128), float("nan"), dtype=state_dtype, device=device) if has_out else None
-    out = torch.full_like(inputs[2], float("nan"))
-    varlen = batch == 1 and len(lengths) > 1
-    cu = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], device=device) if varlen else None
-    q, k, v, g, beta, a_log, bias = inputs
-    npu_fwd(q, k, v, g, beta, 128 ** -0.5, out, a_log, bias,
-            initial_state=initial, final_state=final, cu_seqlens=cu)
-    expected_out, expected_state = recurrent_reference(inputs, initial, lengths if varlen else None)
-    assert_close(out, expected_out)
-    if final is not None:
-        assert_close(final, expected_state)
+
+    def tensor(shape, dtype=torch.bfloat16, *, contiguous=True, device="npu:0"):
+        value = torch.zeros(shape, dtype=dtype, device=device if real_npu else "cpu")
+        if not contiguous:
+            value = value.transpose(-1, -2).contiguous().transpose(-1, -2)
+            assert not value.is_contiguous()
+        if real_npu or device == "cpu":
+            return value
+        return _TensorMetadata(value, SimpleNamespace(type="npu", index=int(device[-1])))
+
+    args = {name: tensor((2, 128, 2, 128)) for name in ("q", "k", "v", "g", "out")}
+    args.update(beta=tensor((2, 128, 2)), scale=128 ** -0.5,
+                A_log=tensor((2,), torch.float32), dt_bias=tensor((2, 128), torch.float32),
+                lower_bound=-5.0)
+
+    def refuse_launch(*args, **kwargs):
+        pytest.fail("invalid public input reached native execution")
+
+    monkeypatch.setattr(kda_fwd, "_run_ascendc", refuse_launch)
+    return args, tensor
 
 
-def test_native_dispatch_failure_policy(monkeypatch):
-    """Validation/import failures fall back; runtime errors must stay visible."""
-    from flash_kda_npu.ops import kda_fwd
-    inputs = _make_inputs(1, 1)
-    q, k, v, g, beta, a_log, bias = inputs
-    monkeypatch.setattr(kda_fwd, "_supports_native_npu", lambda *args: True)
+@pytest.mark.parametrize("name", ["q", "k", "v", "g", "beta", "out", "A_log", "dt_bias",
+                                  "initial_state", "final_state"])
+def test_rejects_wrong_dtype(contract, name):
+    args, tensor = contract
+    shape = (2, 2, 128, 128) if name.endswith("state") else args[name].shape
+    args[name] = tensor(shape, torch.float64)
+    with pytest.raises(RuntimeError, match=f"{name} must be"):
+        flash_kda.fwd(**args)
+
+
+@pytest.mark.parametrize("name", ["q", "k", "v", "g", "beta", "out", "A_log", "dt_bias"])
+def test_rejects_implicit_dtype_conversion(contract, name):
+    args, tensor = contract
+    dtype = torch.bfloat16 if name in ("A_log", "dt_bias") else torch.float32
+    args[name] = tensor(args[name].shape, dtype)
+    with pytest.raises(RuntimeError, match=f"{name} must be"):
+        flash_kda.fwd(**args)
+
+
+@pytest.mark.parametrize("name", ["q", "k", "v", "g", "beta", "out", "dt_bias",
+                                  "initial_state", "final_state"])
+def test_rejects_noncontiguous(contract, name):
+    args, tensor = contract
+    shape = (2, 2, 128, 128) if name.endswith("state") else args[name].shape
+    dtype = torch.float32 if name in ("dt_bias", "initial_state", "final_state") else torch.bfloat16
+    args[name] = tensor(shape, dtype, contiguous=False)
+    with pytest.raises(RuntimeError, match=f"{name} must be contiguous"):
+        flash_kda.fwd(**args)
+
+
+@pytest.mark.parametrize("name,shape", [
+    ("q", (128, 2, 128)), ("k", (2, 64, 2, 128)),
+    ("v", (2, 128, 1, 128)), ("g", (2, 128, 2)),
+    ("out", (2, 128, 2, 64)), ("beta", (2, 128, 2, 1)),
+    ("A_log", (2, 1)), ("dt_bias", (128, 2)),
+    ("initial_state", (1, 2, 128, 128)), ("final_state", (2, 2, 128)),
+])
+def test_rejects_wrong_shape(contract, name, shape):
+    args, tensor = contract
+    dtype = torch.float32 if name in ("A_log", "dt_bias", "initial_state", "final_state") else torch.bfloat16
+    args[name] = tensor(shape, dtype)
+    with pytest.raises(RuntimeError, match=f"{name} must"):
+        flash_kda.fwd(**args)
+
+
+@pytest.mark.parametrize("name", ["q", "k", "v", "g", "beta", "out", "A_log", "dt_bias",
+                                  "initial_state", "final_state"])
+def test_rejects_cpu_tensors(contract, name):
+    args, tensor = contract
+    shape = (2, 2, 128, 128) if name.endswith("state") else args[name].shape
+    dtype = torch.float32 if name in ("A_log", "dt_bias", "initial_state", "final_state") else torch.bfloat16
+    args[name] = tensor(shape, dtype, device="cpu")
+    with pytest.raises(RuntimeError, match=f"{name} must be an NPU tensor"):
+        flash_kda.fwd(**args)
+
+
+@pytest.mark.parametrize("initial_dtype,final_dtype", [
+    (torch.bfloat16, torch.float32), (torch.float32, torch.bfloat16),
+])
+def test_rejects_mixed_state_dtypes(contract, initial_dtype, final_dtype):
+    args, tensor = contract
+    args["initial_state"] = tensor((2, 2, 128, 128), initial_dtype)
+    args["final_state"] = tensor((2, 2, 128, 128), final_dtype)
+    with pytest.raises(RuntimeError, match="must have the same dtype"):
+        flash_kda.fwd(**args)
+
+
+@pytest.mark.parametrize("steps", [0, 1, 16, 32, 63, 65, 129])
+def test_rejects_unsupported_length(contract, steps):
+    args, tensor = contract
+    for name in ("q", "k", "v", "g", "out"):
+        args[name] = tensor((2, steps, 2, 128))
+    args["beta"] = tensor((2, steps, 2))
+    with pytest.raises(RuntimeError, match="T >= 64 and T % 64 == 0"):
+        flash_kda.fwd(**args)
+
+
+def test_rejects_unsupported_dimension(contract):
+    args, tensor = contract
+    for name in ("q", "k", "v", "g", "out"):
+        args[name] = tensor((2, 128, 2, 64))
+    args["dt_bias"] = tensor((2, 64), torch.float32)
+    with pytest.raises(RuntimeError, match="only supports D == 128"):
+        flash_kda.fwd(**args)
+
+
+def test_rejects_varlen(contract):
+    args, tensor = contract
+    args["cu_seqlens"] = tensor((3,), torch.int64)
+    with pytest.raises(NotImplementedError, match="does not support cu_seqlens"):
+        flash_kda.fwd(**args)
+
+
+def test_rejects_cross_device_inputs(contract):
+    args, tensor = contract
+    if not isinstance(args["q"], _TensorMetadata) and torch.npu.device_count() < 2:
+        pytest.skip("requires two NPU devices")
+    args["k"] = tensor(args["k"].shape, device="npu:1")
+    with pytest.raises(RuntimeError, match="all inputs must be on q's NPU device"):
+        flash_kda.fwd(**args)
+
+
+@pytest.mark.parametrize("error_type", [ImportError, ValueError, TypeError, RuntimeError])
+def test_native_failures_propagate(contract, monkeypatch, error_type):
+    args, _ = contract
+    error = error_type("injected native failure")
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(kda_fwd, "_run_ascendc", fail)
+    with pytest.raises(error_type, match="injected native failure") as caught:
+        flash_kda.fwd(**args)
+    assert caught.value is error
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("has_in,has_out", [(False, False), (True, False), (False, True), (True, True)])
+def test_valid_state_dispatch(contract, monkeypatch, dtype, has_in, has_out):
+    args, tensor = contract
+    if has_in:
+        args["initial_state"] = tensor((2, 2, 128, 128), dtype)
+    if has_out:
+        args["final_state"] = tensor((2, 2, 128, 128), dtype)
     calls = []
-    monkeypatch.setattr(kda_fwd, "_torch_fallback", lambda *args: calls.append(True))
-    for error in [ImportError, ValueError, TypeError, RuntimeError]:
-        def fail(*args, error=error, **kwargs):
-            raise error("injected native failure")
-        monkeypatch.setattr(kda_fwd, "_run_ascendc", fail)
-        if error is RuntimeError:
-            with pytest.raises(RuntimeError, match="injected"):
-                npu_fwd(q, k, v, g, beta, 128 ** -0.5, torch.empty_like(v), a_log, bias)
-        else:
-            npu_fwd(q, k, v, g, beta, 128 ** -0.5, torch.empty_like(v), a_log, bias)
-    assert len(calls) == 3
-
-
-@pytest.mark.parametrize("device", ["cpu", "npu"])
-@pytest.mark.parametrize("gate_value", [0.0, 8.0])
-def test_bf16_final_state_strong_decay(device, gate_value):
-    from flash_kda_npu.ops.kda_fwd import is_available
-    from flash_kda_npu.tests.torch_ref import assert_close, make_inputs, recurrent_reference
-    if device == "npu" and not is_available():
-        pytest.skip("requires an Ascend NPU")
-    inputs = make_inputs(1, 128, 2, device)
-    inputs[3].fill_(gate_value)
-    q, k, v, g, beta, a_log, bias = inputs
-    final = torch.empty(1, 2, 128, 128, dtype=torch.bfloat16, device=device)
-    out = torch.empty_like(v)
-    npu_fwd(q, k, v, g, beta, 128 ** -0.5, out, a_log, bias, final_state=final)
-    expected_out, expected_state = recurrent_reference(inputs)
-    assert_close(out, expected_out)
-    assert_close(final, expected_state)
+    monkeypatch.setattr(kda_fwd, "_run_ascendc", lambda *a: calls.append(a))
+    assert flash_kda.fwd(**args) is None
+    assert len(calls) == 1
+    # The public wrapper passes the caller's buffers through unchanged.
+    assert calls[0][6] is args["out"]
+    assert calls[0][-2] is args.get("initial_state")
+    assert calls[0][-1] is args.get("final_state")

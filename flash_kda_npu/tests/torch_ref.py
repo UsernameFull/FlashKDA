@@ -121,7 +121,7 @@ def make_inputs(batch, steps, heads, device="cpu", dim=128, gate_dtype=torch.bfl
     q, k = [F.normalize(torch.randn(shape, generator=generator), dim=-1).bfloat16()
             for _ in range(2)]
     v = torch.randn(shape, generator=generator).bfloat16()
-    # Mild decay avoids overflow in the fallback's uncentred chunk exponentials.
+    # Mild decay supplies stable ordinary cases alongside the extreme-gate tests.
     g = (torch.randn(shape, generator=generator) * 0.5 - 2).to(gate_dtype)
     beta = torch.randn(shape[:-1], generator=generator).bfloat16()
     a_log = torch.rand(heads, generator=generator)
