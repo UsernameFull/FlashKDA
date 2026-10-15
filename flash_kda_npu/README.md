@@ -55,8 +55,7 @@ pip install --no-build-isolation .
 ```
 
 `--no-build-isolation` uses the existing PyTorch installation; on an NPU host
-this should already include `torch_npu`.  A Git checkout can also be installed
-directly with `pip install --no-build-isolation git+https://github.com/UsernameFull/FlashKDA.git@npu`.
+this should already include `torch_npu`.
 
 ## Usage
 
@@ -109,12 +108,12 @@ NPU as well.
 python tools/bench_npu_dispatch.py --batch 1 --steps 8192 --heads 96 --dim 128 --gate-dtype fp32
 ```
 
-The default benchmark uses the FlashKDA bf16 gate.  Passing `--gate-dtype fp32`
-measures the release-kernel aligned input.  On the container's Ascend A3
-device with 10 warmup and 20 timed iterations:
+Measured on Ascend A3 (CANN 9.1.0), B=1 T=8192 H=96 D=128, 10 warmup +
+20 timed iterations with `torch.npu.Event` (10 runs, min / median):
 
-- release-aligned fp32 `g`: `min 7.23 ms / median 7.27 ms`;
-- standard bf16 `g` (one dtype conversion): `min 7.66 ms / median 7.68 ms`.
+| gate dtype | min | median | p20 | p80 |
+|---|---|---|---|---|
+| fp32 | 7.254 ms | 7.271 ms | 7.260 ms | 7.280 ms |
+| bf16 (native path input) | 7.602 ms | 7.631 ms | 7.618 ms | 7.642 ms |
 
-Timing uses `torch.npu.Event`; `triton.testing.do_bench` is not used
-because this container's Triton-Ascend build fails kernel compilation.
+The bf16 gate pays one dtype conversion on the host before the kernel.
