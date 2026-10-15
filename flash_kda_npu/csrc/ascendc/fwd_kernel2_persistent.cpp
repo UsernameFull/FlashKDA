@@ -35,6 +35,11 @@
 // stage-1/3 Cube results over to the vector side, and both consumers survive
 // the rounding - the state stays fp32 and every accumulation (v_new = u - d1,
 // out = d2 * scale + d3) is still fp32.
+// Each head owns one GM slot for D1/D2/D3/Vt, reused across chunks.  Before
+// stage 1 overwrites D1/D2, FL_R confirms that the previous stage 4 consumed
+// D2/D3 (and stage 2 consumed D1).  Before stage 2 overwrites Vt, FL_C1 from
+// that next stage 1 provides the same ordering after the previous stage 3's
+// Vt loads.  No slot is shared between heads or AIV subcores.
 //
 // Every tile follows the chunk size.  M = KDA_CHUNK, NG = 2 * BV / M and
 // stage 3's contraction dim is the chunk's row count, so the whole kernel is
@@ -203,8 +208,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 SetFlag<HardEvent::M_FIX>(emf);
                 WaitFlag<HardEvent::M_FIX>(emf);
                 for (int32_t iv = 0; iv < nv; ++iv) {
-                    const uint64_t o0 = static_cast<uint64_t>(bh * nv + iv) * NT * TILE +
-                                        static_cast<uint64_t>(chunk) * TILE;
+                    const uint64_t o0 = static_cast<uint64_t>(bh * nv + iv) * TILE;
                     auto ip1 = FixpipeParamsV220(N, M, M, N, false);
                     ip1.quantPre = QuantMode_t::F322BF16;
                     ip1.unitFlag = 0;
@@ -256,7 +260,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 CrossCoreWaitFlag(FL_V);
                 for (int32_t iv = 0; iv < nv; ++iv) {
                     const int32_t task = bh * nv + iv;
-                    const uint64_t t0 = (static_cast<uint64_t>(task) * NT + chunk) * BV * K;
+                    const uint64_t t0 = static_cast<uint64_t>(task) * BV * K;
                     if (K == FR) {
                         // Same ND == fractal-order shortcut as `la` above: the
                         // [BV, K] tile is one C0 block per row, and the d4 A
@@ -348,7 +352,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                     ip.unitFlag = 0;
                     ip.quantPre = QuantMode_t::F322BF16;
                     Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(
-                        D3[(static_cast<uint64_t>(bh * nv + iv) * NT + chunk) * TILE],
+                        D3[static_cast<uint64_t>(bh * nv + iv) * TILE],
                         cf[NG * M * N_D4 + iv * M * N], ip);
                 }
                 SetFlag<HardEvent::FIX_M>(efm);
@@ -496,7 +500,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 // hazard; a loop does.
                 PipeBarrier<PIPE_ALL>();
                 const uint64_t u0 = static_cast<uint64_t>(c) * M * D;
-                const uint64_t out0 = static_cast<uint64_t>(task * NT + chunk) * TILE;
+                const uint64_t out0 = static_cast<uint64_t>(task) * TILE;
                 // Only this subcore's value half of U is read: the block form
                 // gathers the iv-th 64-column run of each of the M rows.
                 DataCopy(ub, U[u0 + iv * BV], DataCopyParams(M, BV / 16, (D - BV) / 16, 0));
@@ -554,7 +558,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 // (and its MTE3 copies out of ob/s16) may still be in flight.
                 PipeBarrier<PIPE_ALL>();
                 LocalTensor<float> state = st[s * S_TILE];
-                const uint64_t t0 = static_cast<uint64_t>(task * NT + chunk) * TILE;
+                const uint64_t t0 = static_cast<uint64_t>(task) * TILE;
                 const uint64_t d4base = static_cast<uint64_t>(bh) * D * D +
                                         static_cast<uint64_t>(iv) * BV * D;
                 DataCopy(d2, D2[t0], DataCopyParams(M, BV / 16, 0, 0));

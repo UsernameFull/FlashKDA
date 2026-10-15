@@ -593,8 +593,10 @@ def kda_bt16_fwd_ascendc(
     s16 = torch.empty((tasks, BV, D), dtype=torch.bfloat16, device=q.device)
     # d1/d2/d3 cross to the vector side as bf16 (the loop's fixpipe rounds
     # them), so they are allocated bf16: an fp32 allocation would be
-    # silently half-filled.
-    d1 = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
+    # silently half-filled.  The depth-one flag protocol retires each head's
+    # previous chunk before its slot is overwritten, so these handoff buffers
+    # need one chunk per head rather than a copy for every sequence chunk.
+    d1 = torch.empty((tasks, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
     d2 = torch.empty_like(d1)
     d3 = torch.empty_like(d1)
     d4f = torch.empty((bh, D, D), dtype=torch.float32, device=q.device)
@@ -602,7 +604,7 @@ def kda_bt16_fwd_ascendc(
     # strided store, so no host-side permute is needed.
     out_public = out if out is not None else torch.empty(
         (b, t, h, D), dtype=torch.bfloat16, device=q.device)
-    vnew_t = torch.empty((tasks, nt, BV, CHUNK), dtype=torch.bfloat16, device=q.device)
+    vnew_t = torch.empty((tasks, BV, CHUNK), dtype=torch.bfloat16, device=q.device)
     h0 = None if initial_state is None else initial_state.view(bh, D, D)
     # kg goes to the loop in its public [c, CHUNK, D] layout: the AIC loads
     # it into L1 with Nd2Nz and transposes each 16x16 fractal on the way

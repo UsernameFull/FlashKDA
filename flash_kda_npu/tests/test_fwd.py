@@ -66,6 +66,34 @@ def test_native_batched(native_only, batch, steps, heads):
     check_native(batch, steps, heads)
 
 
+@pytest.mark.parametrize("unroll", [1, 3, 8])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_native_head_parameters(native_only, monkeypatch, unroll, with_bias):
+    """Refresh cached metadata across heads, batches and the padded tail."""
+    from flash_kda_npu.ops.ascendc import CHUNK, kda_bt16_fwd_ascendc
+    monkeypatch.setenv("KDA_PRE_UNROLL", str(unroll))
+    inputs = list(make_inputs(2, CHUNK * 5, 3, "npu", gate_dtype=torch.float32))
+    inputs[5] = torch.tensor([-1.0, 0.25, 1.0], device="npu")
+    inputs[6] = torch.linspace(-0.5, 0.5, 3 * 128, device="npu").reshape(3, 128)
+    if not with_bias:
+        inputs[6].zero_()
+    q, k, v, g, beta, a_log, bias = inputs
+    out, state = kda_bt16_fwd_ascendc(
+        q, k, v, g, beta.float(), A_log=a_log,
+        bias=bias if with_bias else None, output_final_state=True)
+    torch.npu.synchronize()
+    expected_out, expected_state = recurrent_reference(inputs)
+    assert_close(out, expected_out)
+    assert_close(state, expected_state)
+
+
+@pytest.mark.parametrize("blocks", [1, 2, 4])
+def test_native_reused_handoff_slots(native_only, monkeypatch, blocks):
+    """Exercise repeated handoffs with one, two or four heads per block."""
+    monkeypatch.setenv("KDA_PERSIST_LOOP_BLOCKS", str(blocks))
+    check_native(1, 512, 4, gate_dtype=torch.float32)
+
+
 @pytest.mark.parametrize("gate_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("gate_value", [-8.0, -4.0, 0.0, 8.0])
 def test_native_gate_sweep(native_only, gate_dtype, gate_value):

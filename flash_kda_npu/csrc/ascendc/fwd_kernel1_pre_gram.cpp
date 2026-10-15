@@ -446,6 +446,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     const int32_t nt = T / M;
     const DataCopyPadExtParams<bfloat16_t> padNop(false, 0, 0, 0);
     const DataCopyPadExtParams<float> padNopF(false, 0, 0, 0);
+    const DataCopyPadExtParams<float> padScalar(true, 0, 7, 0);
     const int32_t nchunk = B * H * nt;
 
     TPipe pipe;
@@ -565,11 +566,14 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
                                      : static_cast<int32_t>(GetBlockIdx()) / ratio;
     const int32_t sub = static_cast<int32_t>(GetSubBlockIdx());
     int32_t cprev = -1;
+    int32_t cachedHead = -1;
+    float aexp = 0.0f;
     for (int32_t u = 0; u < unroll; ++u) {
     int32_t c = group * 2 * unroll + 2 * u + sub;
     if (c >= nchunk) c = nchunk - 1;
     const int32_t bh = c / nt;
     const int32_t head = bh % H;
+    const bool headChanged = head != cachedHead;
     const uint64_t m0 = static_cast<uint64_t>(c) * M * M;
     const uint64_t x0 = static_cast<uint64_t>(c) * N;
     // The cross-band k side's ring is BS rows per chunk (see the constants).
@@ -593,7 +597,12 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // MT rows, which is what keeps the staging at its KDA_CHUNK = 16 size.
     DataCopyPad(gf, G[xb], DataCopyExtParams(M, D * 4, gRowBytes, 0, 0), padNopF);
     SetFlag<HardEvent::MTE2_V>(e2vg);
-    DataCopy(alog, Alog[head], 8);
+    if (headChanged) {
+        // A_log has exactly H elements.  Fetch just this scalar, including
+        // for the final head, and pad the UB vector without reading past GM.
+        DataCopyPad(alog, Alog[head], DataCopyExtParams(1, sizeof(float), 0, 0, 0),
+                    padScalar);
+    }
     DataCopy(beta, Beta[cm], DataCopyParams(1, M / 8, 0, 0));
     // One set/one wait: the beta sigmoid below needs the G/log/beta loads in
     // UB, and the wait is the only consumer of this channel.
@@ -612,17 +621,24 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     PipeBarrier<PIPE_V>();
 
     if (pBias != nullptr) {
-        DataCopy(bias, Bias[head * D], DataCopyParams(1, 16, 0, 0));
-        SetFlag<HardEvent::MTE2_V>(e2v);
-        WaitFlag<HardEvent::MTE2_V>(e2v);
+        if (headChanged) {
+            DataCopy(bias, Bias[head * D], DataCopyParams(1, 16, 0, 0));
+            SetFlag<HardEvent::MTE2_V>(e2v);
+            WaitFlag<HardEvent::MTE2_V>(e2v);
+        }
         Add(gf, gf, bias, 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
         Add(gf[64], gf[64], bias[64], 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
         PipeBarrier<PIPE_V>();
     }
-    Exp(alog, alog, 8);
-    SetFlag<HardEvent::V_S>(evs);
-    WaitFlag<HardEvent::V_S>(evs);
-    const float aexp = -alog.GetValue(0);
+    if (headChanged) {
+        // Consecutive chunks usually share a head.  Keep its bias in UB and
+        // its exponential in a scalar register across the unrolled loop.
+        Exp(alog, alog, 8);
+        SetFlag<HardEvent::V_S>(evs);
+        WaitFlag<HardEvent::V_S>(evs);
+        aexp = -alog.GetValue(0);
+        cachedHead = head;
+    }
     // The elementwise part of the sigmoid runs in the same NP passes as the
     // rest of the chunk: it needs a full-tile "1.0" operand, and the staging
     // only holds an MT-row tile (see the header note).  The cumsum below is
