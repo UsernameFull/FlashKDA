@@ -30,26 +30,10 @@ flash_kda_npu/
 |   |-- flashkda_reference.py
 |   |-- test_fwd.py
 |   `-- test_fwd_full.py
-|-- benchmarks/
-|   |-- bench.sh
-|   |-- bench_fwd.py
-|   `-- generate_benchmark_md.py
 `-- ops/
     |-- ascendc.py
     `-- kda_fwd.py
 ```
-
-## Requirements
-
-- Ascend 910B-series NPU (the RTC compile targets `Ascend910B3`; other SoCs
-  need a one-line change in `csrc/flash_kda.cpp`);
-- CANN 9.x with `torch_npu` installed into the same PyTorch environment;
-- the launcher in `flash_kda_npu/lib` (built by `build.sh`, or packaged into
-  a wheel when `ASCEND_HOME_PATH` is set at install time).
-
-The first call on a process compiles the five AscendC kernels via RTC
-(tens of seconds); later calls and processes reuse nothing across runs, so
-scripts that measure latency must warm up first.
 
 ## Build
 
@@ -89,9 +73,6 @@ flash_kda.fwd(
 first checks whether the native AscendC path can run and otherwise falls back to
 the chunked PyTorch implementation.
 
-CPU tensors take the same route: they skip the native check (device is not
-NPU) and run the chunked PyTorch implementation directly.
-
 The native path currently requires:
 
 - NPU tensors with `K = V = 128` and `T % 64 == 0`;
@@ -102,24 +83,6 @@ The native path currently requires:
 - `initial_state`, when present, in fp32 or bf16 (converted for the kernel).
 
 Unsupported shapes and varlen inputs fall back to PyTorch.
-
-## Environment variables
-
-| Variable | Default | Effect |
-|---|---|---|
-| `ASCEND_HOME_PATH` | - | CANN root used by `build.sh` and the RTC include paths |
-| `KDA_CHUNK` | `64` | Chunk size; 16 / 32 / 64 supported, other values refused at runtime |
-| `KDA_PROFILE` | off | `1` prints per-stage wall times (`pre_gram / solve / k2`) and launch counts |
-| `KDA_RTC_OPTS` | - | Extra whitespace-separated RTC compiler flags for experiments |
-| `KDA_AIC_CORES` / `KDA_AIV_CORES` | device property | Overrides the detected Cube / vector core counts |
-| `KDA_ALLOW_UNSUPPORTED_CHUNK` | `0` | `1` lets a non-validated `KDA_CHUNK` build run (debug only) |
-
-The remaining variables (`KDA_SOLVE_WIDE_NCHUNK`, `KDA_ASM_NCHUNK`,
-`KDA_WU_NCHUNK`, `KDA_SOLVE_OVERLAP`, `KDA_SOLVE_SLICE_CHUNKS`,
-`KDA_SOLVE_SLICE_TARGET`, `KDA_PRE_UNROLL`, `KDA_PERSIST_LOOP_MAXH`,
-`KDA_PERSIST_LOOP_BLOCKS`) are scheduling internals with sensible defaults;
-they exist for performance work and their interaction is documented in the
-kernel sources.
 
 ## Benchmark
 
