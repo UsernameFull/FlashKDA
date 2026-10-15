@@ -38,11 +38,14 @@ flash_kda_npu/
 |       `-- fwd_kernel2_persistent.cpp
 |-- tests/
 |   |-- conftest.py
+|   |-- cuda_cases.py
 |   |-- run_test_full.sh
 |   |-- test.sh
 |   |-- torch_ref.py
 |   |-- test_fwd.py
-|   `-- test_fwd_full.py
+|   |-- test_fwd_full.py
+|   |-- test_contract.py
+|   `-- test_reference.py
 |-- benchmarks/
 |   |-- bench.sh
 |   |-- bench_fwd.py
@@ -226,10 +229,37 @@ The native K2 recurrence keeps inter-chunk state in fp32, including when the
 final-state buffer is bf16. Only the final store rounds that state to bf16.
 Calls without a requested final state skip its allocation and writeback; the
 last chunk does not publish an unused intermediate state. Gate activation uses
-the FlashKDA default lower bound `-5.0`.  Numerical tests compare against the
-independent CPU fp64 token recurrence with `rtol=atol=5e-3` for outputs and
-ordinary final-state cases. Like the CUDA gate sweep, gate-extreme final states
-use relative RMS error below 0.5%, since weak decay accumulates bf16 rounding.
+the FlashKDA default lower bound `-5.0`. Native diagnostic tests compare against
+an independent CPU fp64 token recurrence with `rtol=atol=5e-3` for outputs and
+ordinary final-state cases. Gate-extreme final states use relative RMS error
+below 0.5%, since weak decay accumulates bf16 rounding.
+
+The CUDA-size numerical matrix uses an independent CPU fp64 chunked solution
+of the same recurrence. Its algebra is checked against the token recurrence,
+including tiny/zero norms, empty sequences, non-default scale and extreme
+gate/bias distributions. Output and final-state relative RMS error must be
+below 0.5% (0.6% for packed outputs, matching the packed gate-sweep budget).
+With CUDA's large `arange` initial states, output error may reach 1%
+in the initial transient: BF16 Cube operands amplify
+dot-product cancellation. The 0.5% output criterion still applies after the
+first 64 tokens of each sequence, independently of native chunk geometry.
+Output windows of at most 1024 tokens are checked separately, so a large
+initial state cannot hide errors later in the sequence. Final states retain
+the 0.5% criterion. The fixed/packed gate-bias sweeps use 0.5%/0.6% respectively
+for outputs; final-state threshold violations produce warnings, as in CUDA.
+Nonfinite outputs or states always fail.
+As in CUDA's FLA comparison, the gate-bias sweep asserts global RMS and records
+window errors as diagnostics.
+
+The W/U solve exports U in FP32, and K2
+keeps its Cube-to-vector D1/D2/D3 handoffs in FP32 until residual/output
+addition. Cube matrix operands remain BF16. These precision changes add
+FP32 U and handoff traffic; benchmark their end-to-end cost on target hardware.
+
+These criteria measure error against mathematical fp64 results. CUDA's
+`torch_ref.py` instead emulates CUDA instructions, reductions and BF16 state
+rounding and requires `torch.equal`; it is not portable to Ascend. Matching
+the case matrix does not establish bitwise CUDA/NPU numerical equality.
 `lower_bound` is passed
 through the API; `-5.0` is the default rather than a hardcoded kernel constant.
 
@@ -240,9 +270,9 @@ python -m pytest -q flash_kda_npu/tests/
 # Matching CUDA test entry points (from a repository checkout):
 bash flash_kda_npu/tests/test.sh
 bash flash_kda_npu/tests/run_test_full.sh
-# CUDA-scale 128K/1M-token native cases (opt-in):
+# Include all CUDA-scale 128K/1M-token fixed and packed cases (opt-in):
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest -q \
-    flash_kda_npu/tests/test_fwd.py -k native_long --run-long
+    flash_kda_npu/tests/ --run-long
 # Test alternate native geometries in separate processes:
 KDA_CHUNK=16 python -m pytest -q flash_kda_npu/tests/test_fwd.py -k configured_chunk
 KDA_CHUNK=32 python -m pytest -q flash_kda_npu/tests/test_fwd.py -k configured_chunk
@@ -254,12 +284,28 @@ gate extremes, multiple chunks, alternate chunk sizes, and opt-in long
 sequences. It also covers partial chunks (including one token), independent
 packed sequence states, empty sequences and invalid boundaries. These tests verify
 the persistent kernel launched. It also checks launcher ABI validation and
-device switching when two NPUs are available. `test_fwd_full.py` checks the
-public tensor contract, unsupported shapes, state dtype consistency, buffer
-identity and exception propagation. Contract tests run with metadata doubles
+device switching when two NPUs are available. It additionally mirrors CUDA's
+ten gate/bias distributions with 8192-token fixed and six-sequence packed
+inputs, using uniform Q/K/V and BF16-rounded random initial states.
+
+`test_fwd_full.py` mirrors all 580 CUDA full-suite cases: 288 fixed-length,
+192 packed variable-length, 96 batched, and four opt-in long cases. Parameter
+names, IDs, state combinations and dtypes match CUDA. It also runs the two
+seed-0 H=96 smoke scenarios from CUDA's `test_fwd.py`. Fixtures use CUDA's
+distributions and generation order, including standard-normal gates, uniform
+dt_bias and `arange -> BF16 -> requested dtype` states. They are generated on
+CPU; CPU and CUDA random engines produce different bytes. Existing native
+diagnostic fixtures and their pointwise/bitwise assertions remain in place.
+Every numerical test checks that the persistent AscendC kernel launched.
+
+`test_contract.py` checks the public tensor contract, unsupported shapes,
+state dtype consistency, buffer identity and exception propagation. Contract
+tests run with metadata doubles
 on CPU hosts and with real NPU tensors when available; native numerical tests
 are skipped on hosts without an NPU. The lower-level tests also cover FP32
 gates, which are internal to AscendC rather than public API inputs.
-Reference implementations and test helpers are in
-`tests/torch_ref.py`. As with the CUDA suite, tests are run from a repository
+`test_reference.py` checks the fp64 oracle and verifies the matrix constants
+and pytest parametrization against CUDA's source through AST comparison,
+without importing CUDA-only helpers. Reference implementations and test
+helpers are in `tests/torch_ref.py`. As with the CUDA suite, tests run from a repository
 checkout rather than installed as part of the package.

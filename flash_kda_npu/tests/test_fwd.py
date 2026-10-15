@@ -1,14 +1,50 @@
 """Native AscendC accuracy and launcher coverage."""
+import warnings
+
 import pytest
 import torch
 
 import flash_kda
 from flash_kda_npu.ops import kda_fwd
 from flash_kda_npu.tests.torch_ref import (
+    CUDA_GATE_CASE_IDS, assert_cuda_accuracy, chunked_reference, make_cuda_gate_case,
+    relative_rms,
     STATE_IDS, STATE_IO, assert_close, assert_relative_rms, make_inputs, make_state, recurrent_reference,
 )
 
 pytestmark = pytest.mark.skipif(not kda_fwd.is_available(), reason="requires an Ascend NPU")
+
+
+@pytest.mark.parametrize("case", range(len(CUDA_GATE_CASE_IDS)), ids=CUDA_GATE_CASE_IDS)
+@pytest.mark.parametrize("seq_lens", [None, [1300, 547, 2048, 963, 271, 3063]],
+                         ids=["fixed", "varlen"])
+def test_cuda_gate_bias_accuracy(case, seq_lens, record_property):
+    """CUDA's FLA sweep scenarios checked against the independent FP64 oracle."""
+    inputs, initial = make_cuda_gate_case(case, seq_lens)
+    q, k, v, g, beta, a_log, bias = [x.to("npu") for x in inputs]
+    init = initial.to("npu")
+    saved = init.clone()
+    final = torch.full_like(init, float("nan"))
+    out = torch.full_like(q, float("nan"))
+    cu = (None if seq_lens is None else torch.tensor(
+        [0, *torch.tensor(seq_lens).cumsum(0).tolist()], dtype=torch.int64, device="npu"))
+    assert flash_kda.fwd(q, k, v, g, beta, 128 ** -0.5, out, a_log, bias, -5.0,
+                         initial_state=init, final_state=final, cu_seqlens=cu) is None
+    torch.npu.synchronize()
+    from flash_kda_npu.ops.ascendc import get_last_profile
+    assert get_last_profile()["launch_counts"].get("kda_k2_persistent_loop", 0) >= 1
+    torch.testing.assert_close(init, saved, rtol=0, atol=0)
+    expected, expected_state = chunked_reference(inputs, initial, seq_lens)
+    threshold = 0.005 if seq_lens is None else 0.006
+    # CUDA's FLA comparison asserts global RMS and plots window errors.
+    assert_cuda_accuracy(out, expected, "output", record_property, threshold,
+                         check_windows=False)
+    # CUDA's FLA sweep reports final-state threshold violations as warnings.
+    state_ratio = relative_rms(final, expected_state)  # Nonfinite values still fail.
+    record_property("state_relative_rms", state_ratio)
+    if state_ratio >= threshold:
+        warnings.warn(f"gate sweep state relative RMS {state_ratio:.6g} >= {threshold}",
+                      RuntimeWarning, stacklevel=2)
 
 
 def check_native(batch, steps, heads, state_dtype=torch.float32,

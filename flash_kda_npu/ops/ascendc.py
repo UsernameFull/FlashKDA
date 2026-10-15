@@ -596,7 +596,8 @@ def kda_bt16_fwd_ascendc(
 
     a16 = torch.empty((c_solve, CHUNK, CHUNK), dtype=torch.bfloat16, device=q.device)
     W = torch.empty((c_solve, CHUNK, D), dtype=torch.bfloat16, device=q.device)
-    U = torch.empty_like(W)
+    # U is consumed by vector subtraction, so retain its FP32 Cube sum.
+    U = torch.empty(W.shape, dtype=torch.float32, device=q.device)
     mark("solve_start")
     if SOLVE_WIDE_SUBB > 1:
         # Two-level solve: the wide kernel writes A16's diagonal sub-blocks
@@ -657,12 +658,12 @@ def kda_bt16_fwd_ascendc(
         state_output = (final_state.view(tasks, BV, D) if final_state is not None
                         else torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device))
     s16 = torch.empty((tasks, BV, D), dtype=torch.bfloat16, device=q.device)
-    # d1/d2/d3 cross to the vector side as bf16 (the loop's fixpipe rounds
-    # them), so they are allocated bf16: an fp32 allocation would be
-    # silently half-filled.  The depth-one flag protocol retires each head's
+    # Keep Cube accumulators in FP32 across the vector handoff: rounding these
+    # results to BF16 before residual/output addition amplifies cancellation.
+    # The depth-one flag protocol retires each head's
     # previous chunk before its slot is overwritten, so these handoff buffers
     # need one chunk per head rather than a copy for every sequence chunk.
-    d1 = torch.empty((tasks, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
+    d1 = torch.empty((tasks, CHUNK, BV), dtype=torch.float32, device=q.device)
     d2 = torch.empty_like(d1)
     d3 = torch.empty_like(d1)
     d4f = torch.empty((bh, D, D), dtype=torch.float32, device=q.device)

@@ -47,12 +47,13 @@ static __aicore__ inline void run(
     LocalTensor<uint8_t> a8(TPosition::A2, 0, 2 * NC * M * K * 2);
     LocalTensor<uint8_t> b8(TPosition::B2, 0, 2 * NC * D * K * 2);
     LocalTensor<bfloat16_t> a16l1 = bufA16.Get<bfloat16_t>();
-    GlobalTensor<bfloat16_t> A16, Rk, Rv, W, U;
+    GlobalTensor<bfloat16_t> A16, Rk, Rv, W;
+    GlobalTensor<float> U;
     A16.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pA16));
     Rk.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pRk));
     Rv.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pRv));
     W.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pW));
-    U.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pU));
+    U.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pU));
 
     for (int32_t ch = 0; ch < nch; ++ch) {
 #if KDA_CHUNK > 16
@@ -119,7 +120,8 @@ static __aicore__ inline void run(
             if (pass == 0) {
                 Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(W[static_cast<uint64_t>(c0 + ch) * M * D], cf, ip);
             } else {
-                Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(U[static_cast<uint64_t>(c0 + ch) * M * D], cf, ip);
+                ip.quantPre = QuantMode_t::NoQuant;
+                Fixpipe<float, float, CFG_ROW_MAJOR>(U[static_cast<uint64_t>(c0 + ch) * M * D], cf, ip);
             }
             qb.FreeTensor(lb);
         }

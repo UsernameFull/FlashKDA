@@ -8,4 +8,5 @@ fi
 
 pip install -e . --no-build-isolation
 pip install pytest
-python -m pytest flash_kda_npu/tests/test_fwd.py -x -v "$@"
+python -m pytest flash_kda_npu/tests/test_fwd.py \
+    flash_kda_npu/tests/test_fwd_full.py::test_cuda_smoke -x -v "$@"
