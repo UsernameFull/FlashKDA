@@ -102,7 +102,7 @@ def test_npu_fallback_supports_other_dimension():
 @pytest.mark.parametrize("batch,lengths", [(1, [17]), (1, [17, 33, 65]), (2, [37, 37])])
 def test_fallback_recurrence(device, state_dtype, has_in, has_out, batch, lengths):
     from flash_kda_npu.ops.kda_fwd import is_available
-    from flash_kda_npu.tests.helpers import assert_close, make_inputs, make_state, recurrent_reference
+    from flash_kda_npu.tests.torch_ref import assert_close, make_inputs, make_state, recurrent_reference
     if device == "npu" and not is_available():
         pytest.skip("requires an Ascend NPU")
     steps = sum(lengths) if batch == 1 else lengths[0]
@@ -145,7 +145,7 @@ def test_native_dispatch_failure_policy(monkeypatch):
 @pytest.mark.parametrize("gate_value", [0.0, 8.0])
 def test_bf16_final_state_fallback_strong_decay(device, gate_value):
     from flash_kda_npu.ops.kda_fwd import is_available
-    from flash_kda_npu.tests.helpers import assert_close, make_inputs, recurrent_reference
+    from flash_kda_npu.tests.torch_ref import assert_close, make_inputs, recurrent_reference
     if device == "npu" and not is_available():
         pytest.skip("requires an Ascend NPU")
     inputs = make_inputs(1, 128, 2, device)

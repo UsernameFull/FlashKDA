@@ -4,7 +4,7 @@ import torch
 
 import flash_kda
 from flash_kda_npu.ops import kda_fwd
-from flash_kda_npu.tests.helpers import (
+from flash_kda_npu.tests.torch_ref import (
     STATE_IDS, STATE_IO, assert_close, assert_relative_rms, make_inputs, make_state, recurrent_reference,
 )
 

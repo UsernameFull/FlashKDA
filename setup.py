@@ -119,8 +119,7 @@ setup(
     version='0.0.1' + rev,
     description='FlashKDA: Flash Kimi Delta Attention',
     ext_modules=ext_modules,
-    packages=['flash_kda', 'flash_kda_npu', 'flash_kda_npu.ops',
-              'flash_kda_npu.tests'],
+    packages=['flash_kda', 'flash_kda_npu', 'flash_kda_npu.ops'],
     package_data={
         'flash_kda_npu': [
             'README.md',

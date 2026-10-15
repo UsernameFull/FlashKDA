@@ -37,7 +37,10 @@ flash_kda_npu/
 |       |-- fwd_kernel1_solve_cube.cpp
 |       `-- fwd_kernel2_persistent.cpp
 |-- tests/
-|   |-- flashkda_reference.py
+|   |-- conftest.py
+|   |-- run_test_full.sh
+|   |-- test.sh
+|   |-- torch_ref.py
 |   |-- test_fwd.py
 |   `-- test_fwd_full.py
 |-- benchmarks/
@@ -188,6 +191,9 @@ through the API; `-5.0` is the default rather than a hardcoded kernel constant.
 
 ```bash
 python -m pytest -q flash_kda_npu/tests/
+# Matching CUDA test entry points (from a repository checkout):
+bash flash_kda_npu/tests/test.sh
+bash flash_kda_npu/tests/run_test_full.sh
 # CUDA-scale 128K/1M-token native cases (opt-in):
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest -q \
     flash_kda_npu/tests/test_fwd.py -k native_long --run-long
@@ -202,5 +208,6 @@ chunk sizes, and opt-in long sequences. These tests reject fallback and verify
 the persistent kernel launched. `test_fwd_full.py` checks fallback state layout,
 sequence boundaries, strong decay, bf16 final states, and dispatch failure
 policy. Fallback cases run on both CPU and NPU; NPU cases are skipped on hosts
-without an NPU. The independent oracle is in `tests/helpers.py`; the existing
-chunked reference remains in `tests/flashkda_reference.py`.
+without an NPU. Reference implementations and test helpers are in
+`tests/torch_ref.py`. As with the CUDA suite, tests are run from a repository
+checkout rather than installed as part of the package.
