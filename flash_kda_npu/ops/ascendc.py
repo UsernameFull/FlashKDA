@@ -552,7 +552,7 @@ def kda_bt16_fwd_ascendc(
         # but land outside the first c.  The two-level operands are null here:
         # the kernel takes them in every build, and a short argument list would
         # leave it reading C out of the args array's tail.
-        solve_args = _pack_ptrs([L, _tri_eye(q.device), a16])
+        solve_args = _pack_ptrs([L, _tri_eye(q.device), a16, None, None])
         solve_args += [_i(c)]
         _launch("kda_solve_wu_wide", c_solve // SOLVE_WIDE_NCHUNK, solve_args, stream)
         # The Cube needs the bf16 A_inv the substitution just wrote, so the two

@@ -105,7 +105,10 @@ def _torch_fallback(
         state_work.copy_(initial_state.reshape(state_work.shape))
 
     beta = torch.sigmoid(beta.float()).to(torch.bfloat16)
-    fallback_chunk = CHUNK
+    # At the default lower_bound=-5, 64-token inverse gates can reach
+    # exp2(64 * 5 * log2(e)), overflowing bf16. Sixteen tokens keep the
+    # exponent below 116 and retain the same causal recurrence.
+    fallback_chunk = 16
 
     for sequence in range(sequences):
         start = int(cu_seqlens_cpu[sequence])
@@ -159,7 +162,7 @@ def _torch_fallback(
             state_new = (delta.float() + state.transpose(-1, -2) * decay).to(
                 state_work.dtype
             )
-            state_work[sequence] = state_new
+            state_work[sequence] = state_new.transpose(-1, -2)
             output[chunk_start:chunk_end] = result[:, :length].transpose(0, 1)
 
     out.copy_(output.reshape(out.shape))

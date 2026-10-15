@@ -58,6 +58,7 @@ def run_bench(extra_argv: list[str]) -> str:
 def parse_stdout(text: str) -> list[dict]:
     cases: list[dict] = []
     current: dict | None = None
+    backend = "unknown"
 
     def new_case_base(kind: str, *, T: int, H: int, D: int,
                       warmup: int, iters: int, repeats: int,
@@ -72,6 +73,9 @@ def parse_stdout(text: str) -> list[dict]:
         return c
 
     for line in text.splitlines():
+        if line.strip().startswith("backend="):
+            backend = line.strip().split()[0].split("=", 1)[1]
+            continue
         m = RE_HEADER_VARLEN.match(line)
         if m:
             if current is not None:
@@ -97,6 +101,7 @@ def parse_stdout(text: str) -> list[dict]:
             for key, field in VARIANT_KEYS.items():
                 if key in name:
                     current[field] = float(mean)
+                    current[field.replace("_mean_ms", "_backend")] = backend
 
     if current is not None:
         cases.append(current)
@@ -127,8 +132,8 @@ def _case_detail(c: dict) -> str:
     return f"Varlen, `seq_lens`=`{seq}`"
 
 
-def _fmt_ms(x: float) -> str:
-    return f"{x:.4f}"
+def _fmt_ms(x: float | None) -> str:
+    return "—" if x is None else f"{x:.4f}"
 
 
 def _argv_with_h(argv: list[str], h: int) -> list[str]:
@@ -150,15 +155,16 @@ def _argv_with_h(argv: list[str], h: int) -> list[str]:
 
 def _render_table_block(cases: list[dict]) -> list[str]:
     lines: list[str] = [
-        "| Case | bf16 state (ms) | no state (ms) | fp32 state (ms) |",
-        "|------|----------------:|---------------:|----------------:|",
+        "| Case | bf16 state (ms) | no state (ms) | fp32 state (ms) | Backends (bf16 / none / fp32) |",
+        "|------|----------------:|---------------:|----------------:|------------------------------|",
     ]
     for c in cases:
         cell = _case_detail(c).replace("|", "\\|")
         lines.append(
             f"| {cell} | {_fmt_ms(c['bf16_mean_ms'])} |"
             f" {_fmt_ms(c['nostate_mean_ms'])} |"
-            f" {_fmt_ms(c['fp32_mean_ms'])} |"
+            f" {_fmt_ms(c['fp32_mean_ms'])} | "
+            + " / ".join(c.get(f"{key}_backend", "—") for key in ("bf16", "nostate", "fp32")) + " |"
         )
     lines.append("")
     return lines
