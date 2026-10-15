@@ -54,7 +54,7 @@ void EnsureRt() {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "rtc_compile",
-        [](const std::string &src, const std::string &funcName, const std::string &arch) {
+        [](const std::string &src, const std::string &funcName) {
             EnsureRt();
             aclrtcProg prog = nullptr;
             Check(aclrtcCreateProg(&prog, src.c_str(), funcName.c_str(), 0, nullptr, nullptr),
@@ -74,34 +74,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 "/x86_64-linux";
 #endif
             std::vector<std::string> optStrs = {
-                arch.empty() ? "--npu-soc=Ascend910B3" : arch,
-                "-O3",
-                "-std=c++17",
-                "-I" + ascBase + "/tikcpp/tikcfw",
-                "-I" + ascBase + "/tikcpp/tikcfw/interface",
-                "-I" + ascBase + "/tikcpp/tikcfw/impl",
-                "-I" + ascBase + "/asc",
-                "-I" + ascBase + "/asc/include",
-                "-I" + ascBase + "/asc/include/basic_api",
-                "-I" + ascBase + "/asc/include/adv_api",
-                "-I" + ascBase + "/asc/include/c_api",
-                "-I" + ascBase + "/asc/impl/basic_api",
-                "-I" + ascBase + "/asc/impl/adv_api",
-                "-I" + ascBase + "/asc/impl/c_api",
-                "-I" + ascBase + "/asc/impl/utils",
+                "--npu-soc=Ascend910B3", "-O3", "-std=c++17",
                 "-include" + cannHome + "/include/version/asc_devkit_version.h",
             };
-            // Extra compiler options for experiments, whitespace separated:
-            //   KDA_RTC_OPTS="--cce-disable-asc-reserved-ubuf -O2"
-            std::vector<std::string> extraOpts;
+            for (const char *sub : {"tikcpp/tikcfw", "tikcpp/tikcfw/interface",
+                                     "tikcpp/tikcfw/impl", "asc", "asc/include",
+                                     "asc/include/basic_api", "asc/include/adv_api",
+                                     "asc/include/c_api", "asc/impl/basic_api",
+                                     "asc/impl/adv_api", "asc/impl/c_api",
+                                     "asc/impl/utils"}) {
+                optStrs.push_back("-I" + ascBase + "/" + sub);
+            }
             if (const char *extra = std::getenv("KDA_RTC_OPTS")) {
                 std::stringstream ss(extra);
                 std::string tok;
                 while (ss >> tok) {
-                    extraOpts.push_back(tok);
-                }
-                for (auto &o : extraOpts) {
-                    optStrs.push_back(o);
+                    optStrs.push_back(tok);
                 }
             }
             std::vector<const char *> options;
@@ -137,7 +125,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             g_funcs[funcName] = fn;
             return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fn));
         },
-        py::arg("src"), py::arg("func_name"), py::arg("arch") = "");
+        py::arg("src"), py::arg("func_name"));
     m.def(
         "launch_argsarray_engine",
         [](const std::string &name, uint32_t numBlocks, uint64_t stream,

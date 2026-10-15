@@ -104,7 +104,7 @@ constexpr uint16_t FL_R = 3;
 extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
     GM_ADDR pU, GM_ADDR pW, GM_ADDR pQg, GM_ADDR pAqk, GM_ADDR pKgT, GM_ADDR pDecay,
     GM_ADDR pD1, GM_ADDR pD2, GM_ADDR pD3, GM_ADDR pD4,
-    GM_ADDR pOut, GM_ADDR pVnew, GM_ADDR pVnewT,
+    GM_ADDR pOut, GM_ADDR pVnewT,
     GM_ADDR pH0, GM_ADDR pS32, GM_ADDR pS16,
     int32_t BH, int32_t NT, int32_t NV, int32_t NBLK, float scale, int32_t NH) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
@@ -380,11 +380,10 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         for (int32_t h = blk; h < BH && nh < MAXH; h += NBLK) heads[nh++] = h;
         if (nh == 0) return;
 
-        GlobalTensor<bfloat16_t> U, V, Vt, S16, Out;
+        GlobalTensor<bfloat16_t> U, Vt, S16, Out;
         GlobalTensor<float> D4, Decay, H0, S32;
         GlobalTensor<bfloat16_t> D1, D2, D3;
         U.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pU));
-        V.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pVnew));
         Vt.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pVnewT));
         S16.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pS16));
         D1.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pD1));
@@ -537,11 +536,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 PipeBarrier<PIPE_V>();
                 SetFlag<HardEvent::V_MTE3>(ev3);
                 WaitFlag<HardEvent::V_MTE3>(ev3);
-                if (pVnew != nullptr) DataCopy(V[out0], vb, DataCopyParams(M, BV / 16, 0, 0));
-                // `V` is the row-major twin of the packed `Vt` below, and
-                // nothing in this kernel reads it: the AIC takes every operand
-                // from `Vt`, so the only consumer is the host under
-                // return_intermediates.  The transposes above leave the
+                // The transposes above leave the
                 // [BV, M] tile in packed 16 x 16 block order, exactly the A
                 // operand's band walk rather than a row-major tile.  Vt gets
                 // that packed order in one call; the B operand's block

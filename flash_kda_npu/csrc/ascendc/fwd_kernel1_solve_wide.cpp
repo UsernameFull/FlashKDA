@@ -72,15 +72,9 @@ constexpr int32_t CE = MM;        // one [M, M] block per chunk
 // which is exactly how the Lneg export is laid out in GM.  The per-chunk
 // stride is MM and the tile totals NCH * MM elements.
 
-// ``a16Mode`` selects what the kernel exports.  0 = production (both
-// stores), 1 = no strict-upper blank, 2 = no parent tile at all.  Modes 1/2
-// leave the Cube solve with a partially written operand *on purpose* - they
-// are diagnostic modes, not correct production paths - and the single-level
-// build (SB == 1), where that tile is the kernel's only output, ignores the
-// mode.
 extern "C" __global__ __aicore__ void kda_solve_wu_wide(
-    GM_ADDR pL, GM_ADDR pEye, GM_ADDR pA32, GM_ADDR pA16, GM_ADDR pXb,
-    GM_ADDR pLneg, int32_t C, int32_t a16Mode, int32_t debugStores) {
+    GM_ADDR pL, GM_ADDR pEye, GM_ADDR pA16, GM_ADDR pXb,
+    GM_ADDR pLneg, int32_t C) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     const int32_t c0 = GetBlockIdx() * NCH;
     if (c0 >= C) return;
@@ -115,29 +109,19 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
     LocalTensor<float> lraw = bLraw.Get<float>(), cexp = bCexp.Get<float>();
     LocalTensor<float> af = bAf.Get<float>(), eye = bEye.Get<float>();
     LocalTensor<bfloat16_t> ab = bAb.Get<bfloat16_t>();
-#if KDA_SOLVE_WIDE_SUBB > 1
-    LocalTensor<float> zf = bZf.Get<float>();
-    LocalTensor<bfloat16_t> zrow = bZb.Get<bfloat16_t>();
-    // The two diagnostic modes (see the signature).  Declared here, not at
-    // the stores: the blank's *source* is built above the recursion.
-    const bool writeBlank = (a16Mode == 0);
-    const bool writeDiagA16 = (a16Mode <= 1);
-#else
-    const bool writeBlank = false;
-    const bool writeDiagA16 = true;   // SB == 1: the parent tile is the output
-#endif
-    GlobalTensor<float> L, Eye, A32;
+    GlobalTensor<float> L, Eye;
     GlobalTensor<bfloat16_t> A16;
 #if KDA_SOLVE_WIDE_SUBB > 1
     LocalTensor<float> l21f = bL21f.Get<float>();
     LocalTensor<bfloat16_t> l21b = bL21b.Get<bfloat16_t>();
+    LocalTensor<float> zf = bZf.Get<float>();
+    LocalTensor<bfloat16_t> zrow = bZb.Get<bfloat16_t>();
     GlobalTensor<bfloat16_t> Xb, Lneg;
     Xb.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pXb));
     Lneg.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pLneg));
 #endif
     L.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pL));
     Eye.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pEye));
-    A32.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pA32));
     A16.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pA16));
 
     DataCopy(eye, Eye[0], DataCopyParams(M, M / 8, 0, 0));
@@ -171,11 +155,9 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
     Cast(l21b, l21f, RoundMode::CAST_RINT, NCH * CE);
 #endif
 #if KDA_SOLVE_WIDE_SUBB > 1
-    if (writeBlank) {
-        Duplicate(zf, 0.0f, MM);
-        PipeBarrier<PIPE_V>();
-        Cast(zrow, zf, RoundMode::CAST_RINT, MM);
-    }
+    Duplicate(zf, 0.0f, MM);
+    PipeBarrier<PIPE_V>();
+    Cast(zrow, zf, RoundMode::CAST_RINT, MM);
 #endif
     PipeBarrier<PIPE_V>();
 
@@ -192,23 +174,10 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
         }
         PipeBarrier<PIPE_V>();
     }
-    // A32 has no device consumer at all (the Cube solve reads A16, W and U and
-    // the debug views are host-side), so production skips its stores - 201 MB
-    // per call at C=64 (docs 11.29).  The flag is declared here because the
-    // bf16 round trip below reads it: the fp32 refresh exists only so the A32
-    // view is the rounded twin of A16, and with no A32 reader it is dead work
-    // (docs 11.64).  It has to sit outside the SUBB > 1 block below: the
-    // second store it guards is the single-level path's, which is exactly the
-    // C=16/32 builds.
-    const bool keepA32 = (debugStores != 0);
     for (int32_t off = 0; off < CH; off += CM) {
         const int32_t n = (CH - off < CM) ? (CH - off) : CM;
         Cast(ab[off], af[off], RoundMode::CAST_RINT, n);
         PipeBarrier<PIPE_V>();
-        if (keepA32) {
-            Cast(af[off], ab[off], RoundMode::CAST_NONE, n);
-            PipeBarrier<PIPE_V>();
-        }
     }
 
     SetFlag<HardEvent::V_MTE3>(e3);
@@ -218,18 +187,13 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
     // fp32 twin the debug views hand out - leaving it uninitialised made the
     // two disagree on a block that is zero in A_inv.
     // The A16 store next to each one is the one that has to stay.
-    if (writeBlank) {
-        for (int32_t s = 0; s + 1 < SB; ++s) {
-            for (int32_t s2 = s + 1; s2 < SB; ++s2) {
-                for (int32_t ch = 0; ch < NCH; ++ch) {
-                    const uint64_t d = static_cast<uint64_t>(c0 + ch) * PC * PC
-                                       + (s * M) * PC + s2 * M;
-                    if (keepA32) {
-                        DataCopy(A32[d], zf, DataCopyParams(M, M / 8, 0, (PC - M) / 8));
-                    }
-                    DataCopy(A16[d], zrow,
-                             DataCopyParams(M, M / 16, 0, (PC - M) / 16));
-                }
+    for (int32_t s = 0; s + 1 < SB; ++s) {
+        for (int32_t s2 = s + 1; s2 < SB; ++s2) {
+            for (int32_t ch = 0; ch < NCH; ++ch) {
+                const uint64_t d = static_cast<uint64_t>(c0 + ch) * PC * PC
+                                   + (s * M) * PC + s2 * M;
+                DataCopy(A16[d], zrow,
+                         DataCopyParams(M, M / 16, 0, (PC - M) / 16));
             }
         }
     }
@@ -241,14 +205,8 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
             const int32_t t = s * NCH + ch;
             const uint64_t d =
                 static_cast<uint64_t>(c0 + ch) * PC * PC + (s * M) * PC + s * M;
-            if (keepA32) {
-                DataCopy(A32[d], af[t * M],
-                         DataCopyParams(M, M / 8, (NC - 1) * (M / 8), (PC - M) / 8));
-            }
-            if (writeDiagA16) {
-                DataCopy(A16[d], ab[t * M],
-                         DataCopyParams(M, M / 16, (NC - 1) * (M / 16), (PC - M) / 16));
-            }
+            DataCopy(A16[d], ab[t * M],
+                     DataCopyParams(M, M / 16, (NC - 1) * (M / 16), (PC - M) / 16));
 #if KDA_SOLVE_WIDE_SUBB > 1
             // The same tile again, contiguous, for the coupling kernel: it
             // reads X11 / X22 as plain [M, M] operands.

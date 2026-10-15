@@ -199,66 +199,8 @@ def _solve_streams(device: torch.device):
     return pair
 
 
-def a16_mode() -> int:
-    """A16-store ablation mode for the wide solve (KDA_SOLVE_A16_MODE).
-
-    0 is production: the wide kernel writes both the diagonal sub-blocks of the
-    parent A_inv tile and its strict-upper blank.  1 drops the blank, 2 drops
-    the whole parent tile, leaving the Cube solve a partially written operand
-    (diagnostic only).  Runtime argument, read per call.
-    """
-    return int(os.environ.get("KDA_SOLVE_A16_MODE", "0"))
-
-
-def asm_load_mode() -> int:
-    """Load and intermediate shape for the coupling block (kda_solve_assemble).
-
-    0  one B1 queue per operand, per-chunk calls, P through GM
-    1  batched A/B L1 loads, P through GM
-    2  1 plus P kept on chip (no GM round trip, caller allocates no P tile)
-    3  2 plus a batched pass-1 A16 store
-    4  2 plus one whole-window Xb fill for both passes
-    5  3 and 4 combined; production
-
-    Every mode produces byte-identical operands; this is a scheduling knob,
-    read per call so a probe can flip it between arms of one process.
-    """
-    return int(os.environ.get("KDA_ASM_LOADS", "5"))
-
-
-def cube_a16_resident() -> int:
-    """A16 residency for the solve's Cube kernel (kda_solve_wu_cube_kernel).
-
-    0 re-reads the block's A16 tile at the top of each pass; 1 keeps the
-    block's NC tiles in L1 for both passes and is production.  Runtime
-    argument, read per call.
-    """
-    return int(os.environ.get("KDA_CUBE_A16_RESIDENT", "1"))
-
-
-def cube_load_mode() -> int:
-    """RHS load shape for the solve's Cube kernel (kda_solve_wu_cube_kernel).
-
-    0 issues KF single-band Nd2Nz calls per chunk-pass; 1 merges a chunk's
-    bands into one strided ND run (byte-identical L1 content) and is
-    production.  Runtime argument, read per call.
-    """
-    return int(os.environ.get("KDA_CUBE_LOADS", "1"))
-
-
-def pre_raw_mode() -> int:
-    """Ablation arms for pre_gram's two raw fp32 Gram tiles (KDA_PRE_RAW_MODE).
-
-    Bit 0 drops the Aqk32 fixpipe, bit 1 the L one; a dropping arm computes a
-    wrong answer by construction (the AIV still reads the slot), so 0 is the
-    only shipping value.  Read per call.
-    """
-    return int(os.environ.get("KDA_PRE_RAW_MODE", "0"))
-
-
 def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, eye,
-                            a32, a16, xb, lneg, pmid, rk, rv, W, U, stream,
-                            debug_stores) -> None:
+                            a16, xb, lneg, rk, rv, W, U, stream) -> None:
     """R1 two-level solve: wide kernel (AIV), then assemble + Cube (AIC).
 
     The substitution runs on M = CHUNK/SB sub-blocks (fwd_kernel1_solve_wide.cpp) and
@@ -273,8 +215,6 @@ def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, 
     from leaking into the next slice.  ``c`` is the real chunk count:
     rk/rv/W/U only carry the c real chunks, so the Cube launch - whose
     kernel clamps its loop to the count it is handed - is clamped to them.
-    ``pmid`` (the assemble's P tile) is passed as None when the load mode
-    keeps P on chip; modes 0/1 need it non-null.
     """
     unit = math.lcm(nch, asm_nchunk, wu_nchunk)
     ngrp = c_solve // unit
@@ -311,14 +251,11 @@ def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, 
         sa.wait_stream(cur)
     for glo, ghi in pairs:
         lo, n = glo * unit, (ghi - glo) * unit
-        wargs = _pack_ptrs([L[lo:], eye, a32[lo:], a16[lo:], xb[lo:],
-                            lneg[lo:]]) + [_i(n), _i(a16_mode()), _i(1 if debug_stores else 0)]
+        wargs = _pack_ptrs([L[lo:], eye, a16[lo:], xb[lo:], lneg[lo:]]) + [_i(n)]
         asm_name = "kda_solve_assemble"
-        aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:],
-                            None if pmid is None else pmid[lo:]]) + \
-            [_i(n), _i(asm_load_mode())]
+        aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:]]) + [_i(n)]
         cargs = _pack_ptrs([a16[lo:], rk[lo:], rv[lo:], W[lo:], U[lo:]]) + \
-            [_i(n), _i(cube_a16_resident()), _i(cube_load_mode())]
+            [_i(n)]
         ncube = min(n, c - lo)
         if ovl:
             _launch("kda_solve_wu_wide", n // nch, wargs, sa.npu_stream)
@@ -385,7 +322,7 @@ def _rtc(rel: str, name: str) -> None:
     an editor.
     """
     rtc_compile(_defines() + (ROOT / rel).read_text(encoding="utf-8-sig"),
-                name, "")
+                name)
 
 
 _SOURCES: list[tuple[str, str]] = [
@@ -468,7 +405,6 @@ def kda_bt16_fwd_ascendc(
     A_log: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
     lower_bound: float = -5.0,
-    return_intermediates: bool = False,
     out: torch.Tensor | None = None,
     final_state: torch.Tensor | None = None,
 ):
@@ -476,8 +412,6 @@ def kda_bt16_fwd_ascendc(
 
     ``q/k/v`` are BF16 ``[B, T, H, 128]``, ``g`` is FP32 ``[B, T, H, 128]``,
     ``beta`` and ``A_log``/``bias`` are FP32; returns ``(out, final_state)``,
-    plus the stage tensors when ``return_intermediates`` is set.
-
     """
     # Builds outside the validated set are refused before anything is compiled
     # or launched: a silently wrong answer is the one failure mode this package
@@ -542,14 +476,10 @@ def kda_bt16_fwd_ascendc(
     stream = torch_npu.npu.current_stream().npu_stream
     _compile_all()
 
-    qn = torch.empty((c, CHUNK, D), dtype=torch.bfloat16, device=q.device)
-    kn = torch.empty_like(qn)
-    gate = torch.empty((c, CHUNK, D), dtype=torch.float32, device=q.device)
-    gc = torch.empty_like(gate)
-    beta_out = torch.empty((c, CHUNK), dtype=torch.float32, device=q.device)
     decay = torch.empty((c, D), dtype=torch.float32, device=q.device)
-    rk = torch.empty_like(qn); rv = torch.empty_like(qn)
-    qg = torch.empty_like(qn); kg = torch.empty_like(qn)
+    rk = torch.empty((c, CHUNK, D), dtype=torch.bfloat16, device=q.device)
+    rv = torch.empty_like(rk)
+    qg = torch.empty_like(rk); kg = torch.empty_like(rk)
     aqk32 = torch.empty((c, CHUNK, CHUNK), dtype=torch.float32, device=q.device)
     aqk16 = torch.empty((c, CHUNK, CHUNK), dtype=torch.bfloat16, device=q.device)
     # The wide solve kernel rounds the chunk count up to SOLVE_WIDE_NCHUNK and
@@ -569,20 +499,7 @@ def kda_bt16_fwd_ascendc(
         # writes the c real chunks, so the tail has to be zeroed here.
         L[c:].zero_()
     mask_s, mask_l = _tri_masks(q.device)
-    # Qn/Kn/Gate/Gc are only written when their pointers are non-null (the
-    # ``return_intermediates`` debug path).
-    keep = return_intermediates
-    # Aqk32's masked fp32 copy, A32 and BetaOut are read by nothing on the
-    # device - they exist for the ``return_intermediates`` views - so the two
-    # kernels take a ``debugStores`` flag and production passes 0
-    # (KDA_DEBUG_STORES=1 re-enables).  A flag rather than a null pointer
-    # because the raw Aqk32 slot stays live either way: the pre_gram band
-    # loop reads it back.
-    keep_debug = keep or os.environ.get("KDA_DEBUG_STORES", "0") == "1"
-    pre_head = [q, k, v, g, beta_pack, A_log, bias,
-                qn if keep else None, kn if keep else None,
-                gate if keep else None, gc if keep else None,
-                beta_out, decay, rk, rv, qg, kg]
+    pre_head = [q, k, v, g, beta_pack, A_log, bias, decay, rk, rv, qg, kg]
     pre_tail = [aqk32, aqk16, L, mask_s, mask_l]
     # One block walks `pre_unroll` consecutive chunks; the grid has to be a
     # whole number of AIC waves, and _pre_gram_unroll picks the walk length
@@ -604,18 +521,16 @@ def kda_bt16_fwd_ascendc(
     pre_args = _pack_ptrs(pre_head + [gram_ops[0], gram_ops[1], gram_ops[2], gram_x]
                           + pre_tail)
     pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
-                 _i(qk_row_bytes), _i(g_row_bytes), _i(pre_raw_mode()),
-                 _i(1 if keep_debug else 0)]
+                 _i(qk_row_bytes), _i(g_row_bytes)]
     # One MIX block pairs an AIC with two AIV subcores, so it covers
     # 2 * pre_unroll chunks.
     _launch("kda_pre_gram_mix", (c + 2 * pre_unroll - 1) // (2 * pre_unroll),
             pre_args, stream)
     finish("pre_gram_ms", "pre_gram_start")
 
-    a32 = torch.empty((c_solve, CHUNK, CHUNK), dtype=torch.float32, device=q.device)
     a16 = torch.empty((c_solve, CHUNK, CHUNK), dtype=torch.bfloat16, device=q.device)
-    W = torch.empty_like(qn)
-    U = torch.empty_like(qn)
+    W = torch.empty((c_solve, CHUNK, D), dtype=torch.bfloat16, device=q.device)
+    U = torch.empty_like(W)
     mark("solve_start")
     if SOLVE_WIDE_SUBB > 1:
         # Two-level solve: the wide kernel writes the diagonal sub-blocks (Xb
@@ -627,30 +542,24 @@ def kda_bt16_fwd_ascendc(
         xb = torch.empty((c_solve, SOLVE_WIDE_SUBB, sub, sub), dtype=bf16, device=q.device)
         # The 32-level build exports the single lower-left coupling block.
         lneg = torch.empty((c_solve, sub * sub), dtype=bf16, device=q.device)
-        # Load modes >= 2 keep P on chip, so its GM tile is neither written
-        # nor read; only modes 0/1 need it allocated.
-        pmid = (None if asm_load_mode() >= 2 else
-                torch.empty((c_solve, sub, sub), dtype=bf16, device=q.device))
         _launch_solve_two_level(c_solve, c, SOLVE_WIDE_NCH, ASM_NCHUNK, WU_NCHUNK,
                                 SOLVE_OVERLAP, L,
                                 _tri_eye(q.device, CHUNK // SOLVE_WIDE_SUBB),
-                                a32, a16,
-                                xb, lneg, pmid, rk, rv, W, U, stream,
-                                1 if keep_debug else 0)
+                                a16, xb, lneg, rk, rv, W, U, stream)
     else:
         # One AIV block solves SOLVE_WIDE_NCHUNK chunks with every vector
         # instruction (see the kernel header); the padded chunks are solved too
         # but land outside the first c.  The two-level operands are null here:
         # the kernel takes them in every build, and a short argument list would
         # leave it reading C out of the args array's tail.
-        solve_args = _pack_ptrs([L, _tri_eye(q.device), a32, a16, None, None])
-        solve_args += [_i(c), _i(a16_mode()), _i(1 if keep_debug else 0)]
+        solve_args = _pack_ptrs([L, _tri_eye(q.device), a16])
+        solve_args += [_i(c)]
         _launch("kda_solve_wu_wide", c_solve // SOLVE_WIDE_NCHUNK, solve_args, stream)
         # The Cube needs the bf16 A_inv the substitution just wrote, so the two
         # launches stay ordered on the stream.
         _launch("kda_solve_wu_cube_kernel", (c + WU_NCHUNK - 1) // WU_NCHUNK,
                 _pack_ptrs([a16, rk, rv, W, U]) +
-                [_i(c), _i(cube_a16_resident()), _i(cube_load_mode())],
+                [_i(c)],
                 stream)
     finish("solve_ms", "solve_start")
 
@@ -693,10 +602,6 @@ def kda_bt16_fwd_ascendc(
     # strided store, so no host-side permute is needed.
     out_public = out if out is not None else torch.empty(
         (b, t, h, D), dtype=torch.bfloat16, device=q.device)
-    # `vnew` is written solely for ``return_intermediates`` (the kernel
-    # reads only `vnew_t`); production passes a null pointer.
-    vnew = (torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
-            if return_intermediates else None)
     vnew_t = torch.empty((tasks, nt, BV, CHUNK), dtype=torch.bfloat16, device=q.device)
     h0 = None if initial_state is None else initial_state.view(bh, D, D)
     # kg goes to the loop in its public [c, CHUNK, D] layout: the AIC loads
@@ -705,7 +610,7 @@ def kda_bt16_fwd_ascendc(
     mark("k2_start")
     _launch("kda_k2_persistent_loop", nblk,
             _pack_ptrs([U, W, qg, aqk16, kg, decay, d1, d2, d3, d4f,
-                        out_public, vnew, vnew_t, h0, s32, s16]) +
+                        out_public, vnew_t, h0, s32, s16]) +
             [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale), _i(h)], stream)
     finish("k2_ms", "k2_start")
     final_state = None if not output_final_state else (
@@ -714,12 +619,5 @@ def kda_bt16_fwd_ascendc(
     if profile:
         prof["total_ms"] = sum(v for k, v in prof.items() if k.endswith("_ms"))
         _LAST_PROFILE = prof
-    if not return_intermediates:
-        return out_public, final_state
-    debug = {"Qn": qn, "Kn": kn, "Gate": gate, "Gc": gc, "Beta": beta_out,
-             "Decay": decay, "Rk": rk, "Rv": rv, "Qg": qg, "Kg": kg,
-             "Aqk32": aqk32, "Aqk": aqk16, "L": L[:c], "A32": a32[:c], "A16": a16[:c],
-             "W": W, "U": U, "d1": d1, "d2": d2, "Vnew": vnew, "VnewT": vnew_t,
-             "d3": d3, "d4": d4f, "state_s32": s32}
-    return out_public, final_state, debug
+    return out_public, final_state
 

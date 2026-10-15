@@ -12,10 +12,6 @@
 // One AIC block handles NCHUNK chunks: loads for every chunk are issued up
 // front and the Mmads follow.
 //
-// `a16Mode` selects A16 residency: 0 loads the tile once per pass; 1 fills one
-// L1 buffer before the pass loop and both passes read it.  `loadMode` selects
-// the RHS layout: 0 uses KF single-band calls; 1 issues one Nd2Nz call with
-// ndNum=KF.
 #include "kernel_operator.h"
 using namespace AscendC;
 #ifndef KDA_CHUNK
@@ -30,22 +26,18 @@ constexpr int32_t DF = D / 16;
 constexpr int32_t NC = KDA_WU_NCHUNK;
 
 extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
-    GM_ADDR pA16, GM_ADDR pRk, GM_ADDR pRv, GM_ADDR pW, GM_ADDR pU, int32_t C,
-    int32_t a16Mode, int32_t loadMode) {
+    GM_ADDR pA16, GM_ADDR pRk, GM_ADDR pRv, GM_ADDR pW, GM_ADDR pU, int32_t C) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
     const int32_t c0 = GetBlockIdx() * NC;
     if (c0 >= C) return;
     const int32_t nch = ((C - c0) < NC) ? (C - c0) : NC;
-    const bool a16res = (a16Mode != 0);
     TPipe pipe;
     TEventID e21 = pipe.AllocEventID<HardEvent::MTE2_MTE1>();
     TEventID e1m = pipe.AllocEventID<HardEvent::MTE1_M>();
     TEventID emf = pipe.AllocEventID<HardEvent::M_FIX>();
-    TQue<QuePosition::B1, NC> qa, qb;
-    pipe.InitBuffer(qa, NC, M * K * 2);
+    TQue<QuePosition::B1, NC> qb;
     pipe.InitBuffer(qb, NC, D * K * 2);
-    // a16Mode 1's resident copy: the same NC * M * K * 2 bytes as the qa queue
-    // it replaces, filled once per block instead of once per pass.
+    // The resident A16 copy: one L1 buffer filled once per block, both passes read it.
     TBuf<TPosition::B1> bufA16;
     pipe.InitBuffer(bufA16, NC * M * K * 2);
     // One L0C slot per (pass, chunk) unit.  Slots are never reused inside a
@@ -62,49 +54,25 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
     W.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pW));
     U.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pU));
 
-    if (a16res) {
-        for (int32_t ch = 0; ch < nch; ++ch) {
+    for (int32_t ch = 0; ch < nch; ++ch) {
 #if KDA_CHUNK > 16
-            DataCopy(a16l1[ch * M * K], A16[static_cast<uint64_t>(c0 + ch) * M * K],
-                     Nd2NzParams(1, M, K, 0, K, M, 1, 0));
+        DataCopy(a16l1[ch * M * K], A16[static_cast<uint64_t>(c0 + ch) * M * K],
+                 Nd2NzParams(1, M, K, 0, K, M, 1, 0));
 #else
-            DataCopy(a16l1[ch * M * K], A16[static_cast<uint64_t>(c0 + ch) * M * K], M * K);
+        DataCopy(a16l1[ch * M * K], A16[static_cast<uint64_t>(c0 + ch) * M * K], M * K);
 #endif
-        }
-        SetFlag<HardEvent::MTE2_MTE1>(e21);
-        WaitFlag<HardEvent::MTE2_MTE1>(e21);
     }
+    SetFlag<HardEvent::MTE2_MTE1>(e21);
+    WaitFlag<HardEvent::MTE2_MTE1>(e21);
     for (int32_t pass = 0; pass < 2; ++pass) {
         // Issue every chunk's L1 load before touching L0 so one chunk's GM
         // round trips overlap the previous chunk's arithmetic.
         for (int32_t ch = 0; ch < nch; ++ch) {
-            // a16Mode 1 must not draw from qa: allocated-but-unqueued slots
-            // remain unavailable and the second pass would block on them.
-            if (!a16res) {
-                auto la = qa.AllocTensor<bfloat16_t>();
-#if KDA_CHUNK > 16
-                // One whole-tile call uses column-block-major layout, so the
-                // L0A read below crosses its indices.
-                DataCopy(la, A16[static_cast<uint64_t>(c0 + ch) * M * K],
-                         Nd2NzParams(1, M, K, 0, K, M, 1, 0));
-#else
-                DataCopy(la, A16[static_cast<uint64_t>(c0 + ch) * M * K], M * K);
-#endif
-                qa.EnQue(la);
-            }
             auto lb = qb.AllocTensor<bfloat16_t>();
 #if KDA_CHUNK > 16
             GlobalTensor<bfloat16_t> &rhs = (pass == 0) ? Rk : Rv;
-            if (loadMode == 1) {
-                DataCopy(lb, rhs[static_cast<uint64_t>(c0 + ch) * M * D],
-                         Nd2NzParams(KF, 16, D, 16 * D, D, 16, 1, 16 * D));
-            } else {
-                for (int32_t mm = 0; mm < KF; ++mm) {
-                    DataCopy(lb[mm * DF * 256],
-                             rhs[static_cast<uint64_t>(c0 + ch) * M * D + mm * 16 * D],
-                             Nd2NzParams(1, 16, D, 0, D, 16, 1, 0));
-                }
-            }
+            DataCopy(lb, rhs[static_cast<uint64_t>(c0 + ch) * M * D],
+                     Nd2NzParams(KF, 16, D, 16 * D, D, 16, 1, 16 * D));
 #else
             if (pass == 0) {
                 DataCopy(lb, Rk[static_cast<uint64_t>(c0 + ch) * M * D],
@@ -120,12 +88,7 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
         WaitFlag<HardEvent::MTE2_MTE1>(e21);
 
         for (int32_t ch = 0; ch < nch; ++ch) {
-            LocalTensor<bfloat16_t> la;
-            if (a16res) {
-                la = a16l1[ch * M * K];
-            } else {
-                la = qa.DeQue<bfloat16_t>();
-            }
+            LocalTensor<bfloat16_t> la = a16l1[ch * M * K];
             auto lb = qb.DeQue<bfloat16_t>();
             // L0A/L0B are indexed by the pass as well: the previous pass's mmads
             // may still be reading the same chunk slot.
@@ -157,9 +120,6 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
                 Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(W[static_cast<uint64_t>(c0 + ch) * M * D], cf, ip);
             } else {
                 Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(U[static_cast<uint64_t>(c0 + ch) * M * D], cf, ip);
-            }
-            if (!a16res) {
-                qa.FreeTensor(la);
             }
             qb.FreeTensor(lb);
         }

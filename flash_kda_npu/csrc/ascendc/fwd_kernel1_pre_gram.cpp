@@ -2,9 +2,6 @@
 // (batch, head, chunk) tile: normalize Q/K, prepare the gate/decay terms, and
 // build the two Gram operands consumed by the paired Cube.
 //
-// Qn/Kn/Gate/Gc GM copies are debug-only and are skipped when their pointers
-// are null; production passes null unless `return_intermediates` is set.
-//
 // Per-row scalars use Brcb broadcast: a 16-value tile expands into eight 32B
 // blocks per row, then repeats across 64 lanes once for the low and high
 // halves.  The loop below walks `unroll` chunks; `api.py` chooses 1 for small
@@ -99,8 +96,7 @@ static __aicore__ inline void post_gram(TQue<TPosition::VECIN, 2>& qin,
                                         const GlobalTensor<bfloat16_t> Aqk16,
                                         const GlobalTensor<float> MaskS,
                                         const GlobalTensor<float> MaskL,
-                                        int32_t c, float scale, bool buildMasks,
-                                        bool keepAqk32) {
+                                        int32_t c, float scale, bool buildMasks) {
     const uint64_t m0 = static_cast<uint64_t>(c) * M * M;
     CrossCoreWaitFlag(FL_DONE);
     // The triangular masks are invariant across chunks.  Build their bit form
@@ -172,13 +168,9 @@ static __aicore__ inline void post_gram(TQue<TPosition::VECIN, 2>& qin,
     LocalTensor<float> gA2 = qout.DeQue<float>();
     LocalTensor<float> ga32s = gA2, gl32s = gA2[NB];
     LocalTensor<bfloat16_t> g16s = qo16.DeQue<bfloat16_t>();
-    // The masked fp32 copy has no device consumer: the only reader of Aqk32 is
-    // the band loop above (the raw Gram the Cube wrote), and Aqk16 - the tile
-    // the next launch actually consumes - is rounded from this register value,
-    // not from the store.  It exists for the ``return_intermediates`` views, so
-    // ``debugStores == 0`` skips the 201 MB (C=64) store (docs 11.29).  The raw
-    // Aqk32 pointer has to stay valid either way - this function reads it.
-    if (keepAqk32) DataCopy(Aqk32[o], ga32s, NB);
+    // The masked fp32 copy has no device consumer; Aqk16 - the tile the next
+    // launch actually consumes - is rounded from this register value, not
+    // from a store.  The raw Aqk32 pointer stays live: this function reads it.
     DataCopy(L[o], gl32s, NB);
     DataCopy(Aqk16[o], g16s, NB);
     qout.FreeTensor(gA2);
@@ -195,11 +187,8 @@ static __aicore__ inline void post_gram(TQue<TPosition::VECIN, 2>& qin,
 static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb,
                                            GM_ADDR pGx,
                                            GM_ADDR pAqk32, GM_ADDR pL,
-                                           int32_t nchunk, int32_t unroll,
-                                           int32_t rawMode) {
+                                           int32_t nchunk, int32_t unroll) {
     const int32_t base = GetBlockIdx() * 2 * unroll;
-    const bool keepAqk32Raw = (rawMode & 1) == 0;
-    const bool keepLRaw = (rawMode & 2) == 0;
     TPipe pipe;
     TEventID e21 = pipe.AllocEventID<HardEvent::MTE2_MTE1>();
     TEventID e1m = pipe.AllocEventID<HardEvent::MTE1_M>();
@@ -396,8 +385,8 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
             SetFlag<HardEvent::M_FIX>(emf);
             WaitFlag<HardEvent::M_FIX>(emf);
             const uint64_t m0 = static_cast<uint64_t>(s == 0 ? c0 : c1) * M * M;
-            if (keepAqk32Raw) Fixpipe<float, float, CFG_ROW_MAJOR>(Aqk32[m0], cf0, ip);
-            if (keepLRaw) Fixpipe<float, float, CFG_ROW_MAJOR>(L[m0], cf1, ip);
+            Fixpipe<float, float, CFG_ROW_MAJOR>(Aqk32[m0], cf0, ip);
+            Fixpipe<float, float, CFG_ROW_MAJOR>(L[m0], cf1, ip);
             SetFlag<HardEvent::FIX_M>(efm);
             WaitFlag<HardEvent::FIX_M>(efm);
             qc.FreeTensor(cf0);
@@ -419,12 +408,8 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
                 Mmad(cf3, lkX, lx, MmadParams(BS, BS, D, 0, false, true));
                 SetFlag<HardEvent::M_FIX>(emf);
                 WaitFlag<HardEvent::M_FIX>(emf);
-                if (keepAqk32Raw) {
-                    Fixpipe<float, float, CFG_ROW_MAJOR>(Aqk32[m0 + BS * M], cf2, ipx);
-                }
-                if (keepLRaw) {
-                    Fixpipe<float, float, CFG_ROW_MAJOR>(L[m0 + BS * M], cf3, ipx);
-                }
+                Fixpipe<float, float, CFG_ROW_MAJOR>(Aqk32[m0 + BS * M], cf2, ipx);
+                Fixpipe<float, float, CFG_ROW_MAJOR>(L[m0 + BS * M], cf3, ipx);
                 SetFlag<HardEvent::FIX_M>(efm);
                 WaitFlag<HardEvent::FIX_M>(efm);
                 qc.FreeTensor(cf2);
@@ -448,18 +433,14 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
 extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     GM_ADDR pQ, GM_ADDR pK, GM_ADDR pV, GM_ADDR pG, GM_ADDR pBeta,
     GM_ADDR pAlog, GM_ADDR pBias,
-    GM_ADDR pQn, GM_ADDR pKn, GM_ADDR pGate, GM_ADDR pGc, GM_ADDR pBetaOut,
     GM_ADDR pDecay, GM_ADDR pRk, GM_ADDR pRv, GM_ADDR pQg, GM_ADDR pKg,
     GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb, GM_ADDR pGx,
     GM_ADDR pAqk32, GM_ADDR pAqk16, GM_ADDR pL, GM_ADDR pMaskS, GM_ADDR pMaskL,
     int32_t B, int32_t T, int32_t H, float lower_bound, float scale, int32_t unroll,
-    // ``debugStores`` stays the trailing int32; the diagnostic ``rawMode``
-    // therefore goes in front of it.
-    int32_t xRowBytes, int32_t gRowBytes, int32_t rawMode, int32_t debugStores) {
+    int32_t xRowBytes, int32_t gRowBytes) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     if ASCEND_IS_AIC {
-        run_gram_aic(pGa, pGk, pGb, pGx, pAqk32, pL, B * H * (T / M), unroll,
-                     rawMode);
+        run_gram_aic(pGa, pGk, pGb, pGx, pAqk32, pL, B * H * (T / M), unroll);
     }
     if ASCEND_IS_AIV {
     const int32_t nt = T / M;
@@ -545,13 +526,11 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     LocalTensor<bfloat16_t> rkb = bRkb.Get<bfloat16_t>(), rvb = bRvb.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> qgb = bQgb.Get<bfloat16_t>(), kgb = bKgb.Get<bfloat16_t>();
 
-    GlobalTensor<bfloat16_t> Q, K, V, Qn, Kn, Rk, Rv, Qg, Kg, Ga, Gk, Gb, Gx;
-    GlobalTensor<float> G, Beta, Alog, Bias, Gate, Gc, BetaOut, Decay;
+    GlobalTensor<bfloat16_t> Q, K, V, Rk, Rv, Qg, Kg, Ga, Gk, Gb, Gx;
+    GlobalTensor<float> G, Beta, Alog, Bias, Decay;
     Q.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pQ));
     K.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pK));
     V.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pV));
-    Qn.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pQn));
-    Kn.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pKn));
     Rk.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pRk));
     Rv.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pRv));
     Qg.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pQg));
@@ -564,9 +543,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Beta.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pBeta));
     Alog.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pAlog));
     Bias.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pBias));
-    Gate.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pGate));
-    Gc.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pGc));
-    BetaOut.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pBetaOut));
     Decay.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pDecay));
 
     GlobalTensor<bfloat16_t> Aqk16;
@@ -700,13 +676,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
         PipeBarrier<PIPE_V>();
     }
     Muls(gf, gf, RCP_LN2, N);
-    if (pGate != nullptr) {
-        SetFlag<HardEvent::V_MTE3>(ev3);
-        WaitFlag<HardEvent::V_MTE3>(ev3);
-        DataCopy(Gate[x0], gf, DataCopyParams(M, 16, 0, 0));
-        PipeBarrier<PIPE_ALL>();
-    }
-
     // decay = exp2(gate_last)
     Muls(t2, gf[(M - 1) * D], LN2, D);
     Exp(t2, t2, D);
@@ -720,10 +689,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // block), and the passes after the first already have the store behind
     // them.
     SetFlag<HardEvent::MTE3_V>(e3d);
-    // Same as the masked Aqk32 store: BetaOut feeds the debug views only, so
-    // production switches it off with the same flag.  The flag pair below is
-    // unconditional - it orders the tile's reuse, not this store.
-    if (debugStores != 0) DataCopy(BetaOut[cm], beta, DataCopyParams(1, M / 8, 0, 0));
     LocalTensor<bfloat16_t> pga = bPga0.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> pgk = bPgk0.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> pgb = bPgb0.Get<bfloat16_t>();
@@ -787,23 +752,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     const int32_t mid = MID0 + (hp * MT / BS) * BS;
     Sub(zz, gfp, gf[mid * D], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
     Sub(zz[64], gfp[64], gf[mid * D + 64], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
-    if (pGc != nullptr) {
-        // "Gc" is documented as the chunk-centred gate, so at CHUNK = 64 -
-        // where the reference above is band-centred - the debug tile is
-        // rebuilt against the chunk's middle row instead of storing the
-        // band's (the debug path only; the Gram never reads this, and "gef"
-        // is this pass's free fp32 scratch at this point).
-        if (mid != M / 2) {
-            Sub(gef, gfp, gf[(M / 2) * D], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
-            Sub(gef[64], gfp[64], gf[(M / 2) * D + 64], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
-            PipeBarrier<PIPE_V>();
-        }
-        SetFlag<HardEvent::V_MTE3>(ev3);
-        WaitFlag<HardEvent::V_MTE3>(ev3);
-        DataCopy(Gc[xh], mid == M / 2 ? zz : gef, DataCopyParams(MT, 16, 0, 0));
-        PipeBarrier<PIPE_ALL>();
-    }
-
     Muls(ef, gfp, LN2, NG);
     Exp(ef, ef, NG);
     PipeBarrier<PIPE_V>();
@@ -860,9 +808,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     DataCopy(Kg[xh], kgb, DataCopyParams(MT, 8, 0, 0));
     DataCopy(Rk[xh], rkb, DataCopyParams(MT, 8, 0, 0));
     DataCopy(Rv[xh], rvbo, DataCopyParams(MT, 8, 0, 0));
-    if (pQn != nullptr) DataCopy(Qn[xh], qnb2, DataCopyParams(MT, 8, 0, 0));
-    if (pKn != nullptr) DataCopy(Kn[xh], knb2, DataCopyParams(MT, 8, 0, 0));
-
     // Each pass casts its own MT rows and stores them straight to GM, so the
     // operands never need a whole-chunk UB ring (see the buffer note).
     // Neither the product scratch nor the second exponential needs a tile of
@@ -938,7 +883,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     }
     if (cprev >= 0) {
         post_gram(qgin, qgmk, qgout, qgo16, mbitsAll, Aqk32, L, Aqk16,
-                  MaskS, MaskL, cprev, scale, !masksBuilt, debugStores != 0);
+                  MaskS, MaskL, cprev, scale, !masksBuilt);
         masksBuilt = true;
     }
     // The publish sits *after* the previous step's DONE wait so that at most
@@ -959,7 +904,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     }
     // Drain the pipeline after the final chunk's Gram.
     post_gram(qgin, qgmk, qgout, qgo16, mbitsAll, Aqk32, L, Aqk16,
-              MaskS, MaskL, cprev, scale, !masksBuilt, debugStores != 0);
+              MaskS, MaskL, cprev, scale, !masksBuilt);
     masksBuilt = true;
     PipeBarrier<PIPE_ALL>();
     }
