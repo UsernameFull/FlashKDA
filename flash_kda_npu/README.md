@@ -84,6 +84,21 @@ The native path currently requires:
 
 Unsupported shapes and varlen inputs fall back to PyTorch.
 
+## Benchmark
+
+`benchmarks/` mirrors the CUDA suite's structure: `bench.sh` sources CANN,
+installs the package and runs `bench_fwd.py` (three state variants, fixed
+and varlen cases, `torch.npu.Event` timing); `generate_benchmark_md.py`
+runs it twice (default `H` and `--H 64`) and writes `BENCHMARK_A3.md`.
+
+```bash
+bash flash_kda_npu/benchmarks/bench.sh
+```
+
+Varlen cases exercise the PyTorch fallback path (the native AscendC path
+requires fixed-length batches), so their timings are not comparable to
+the fixed case.
+
 ## Precision
 
 The native K2 recurrence keeps inter-chunk state in fp32.  Gate activation uses
@@ -102,18 +117,3 @@ host; `test_fwd_full.py` covers dispatch decisions and the PyTorch
 fallback (varlen, unsupported dimensions), and runs on hosts without an
 NPU as well.
 
-## Benchmark
-
-```bash
-python benchmarks/bench_npu.py --batch 1 --steps 8192 --heads 96 --dim 128 --gate-dtype fp32
-```
-
-Measured on Ascend A3 (CANN 9.1.0), B=1 T=8192 H=96 D=128, 10 warmup and
-20 timed iterations; min/median/p20/p80 are computed from the 20 samples.
-
-| gate dtype | min | median | p20 | p80 |
-|---|---|---|---|---|
-| fp32 | 7.254 ms | 7.271 ms | 7.260 ms | 7.280 ms |
-| bf16 (native path input) | 7.602 ms | 7.631 ms | 7.618 ms | 7.642 ms |
-
-The bf16 gate pays one dtype conversion on the host before the kernel.
