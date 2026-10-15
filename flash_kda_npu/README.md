@@ -105,11 +105,11 @@ NPU as well.
 ## Benchmark
 
 ```bash
-python tools/bench_npu_dispatch.py --batch 1 --steps 8192 --heads 96 --dim 128 --gate-dtype fp32
+python tools/bench_npu.py --batch 1 --steps 8192 --heads 96 --dim 128 --gate-dtype fp32
 ```
 
-Measured on Ascend A3 (CANN 9.1.0), B=1 T=8192 H=96 D=128, 10 warmup +
-20 timed iterations with `torch.npu.Event` (10 runs, min / median):
+Measured on Ascend A3 (CANN 9.1.0), B=1 T=8192 H=96 D=128, 10 warmup and
+20 timed iterations; min/median/p20/p80 are computed from the 20 samples.
 
 | gate dtype | min | median | p20 | p80 |
 |---|---|---|---|---|
