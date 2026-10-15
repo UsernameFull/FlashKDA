@@ -105,7 +105,7 @@ NPU as well.
 ## Benchmark
 
 ```bash
-python benchmarks/bench_npu.py --batch 1 --steps 8192 --heads 96 --dim 128 --gate-dtype fp32
+bash benchmarks/bench.sh --batch 1 --steps 8192 --heads 96 --dim 128 --gate-dtype fp32
 ```
 
 Measured on Ascend A3 (CANN 9.1.0), B=1 T=8192 H=96 D=128, 10 warmup and
