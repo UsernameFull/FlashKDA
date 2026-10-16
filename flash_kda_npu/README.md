@@ -43,9 +43,7 @@ flash_kda_npu/
 |   |-- test.sh
 |   |-- torch_ref.py
 |   |-- test_fwd.py
-|   |-- test_fwd_full.py
-|   |-- test_contract.py
-|   `-- test_reference.py
+|   `-- test_fwd_full.py
 |-- benchmarks/
 |   |-- bench.sh
 |   |-- bench_fwd.py
@@ -184,19 +182,20 @@ launches for comparison. Chunk 16/32 keeps the single-level solve.
 ## Benchmark
 
 `benchmarks/` mirrors the CUDA suite's structure: `bench.sh` sources CANN,
-installs the package and runs `bench_fwd.py` (three state variants, fixed
-and variable-length cases, `torch.npu.Event` timing); `generate_benchmark_md.py`
+installs the package and FLA operators, and runs `bench_fwd.py` (three FlashKDA
+state variants plus FLA KDA/GDN, fixed and variable-length cases,
+`torch.npu.Event` timing); `generate_benchmark_md.py`
 runs it twice (default `H` and `--H 64`) and writes `BENCHMARK_A3.md`.
 
 ```bash
 bash flash_kda_npu/benchmarks/bench.sh
 # Native-oriented fixed cases only:
 bash flash_kda_npu/benchmarks/bench.sh --mode fixed --H 96
-# Require native execution, using an fp32 initial/final state:
+# FP32-state FlashKDA and FLA comparisons:
 bash flash_kda_npu/benchmarks/bench.sh --mode fixed --state fp32 --require-native
-# Short native smoke run, with machine-readable timings:
+# Short native-only smoke run, with machine-readable timings:
 python flash_kda_npu/benchmarks/bench_fwd.py --mode fixed --T 129 --H 4 \
-    --warmup 1 --iters 2 --repeats 1 --json /tmp/npu-bench.json
+    --skip-fla --warmup 1 --iters 2 --repeats 1 --json /tmp/npu-bench.json
 # Packed native smoke run with partial chunks:
 python flash_kda_npu/benchmarks/bench_fwd.py --mode varlen --seq-lens 17 33 65 \
     --H 4 --warmup 1 --iters 2 --repeats 1
@@ -206,7 +205,30 @@ python flash_kda_npu/benchmarks/generate_benchmark_md.py --mode fixed
 
 The default mode runs both fixed and variable-length cases, as in the CUDA suite.
 Use `--mode fixed` or `--mode varlen` to select one kind.
-All three state variants (bf16, no state, fp32) execute AscendC.
+All three FlashKDA state variants (bf16, no state, fp32) execute AscendC.
+The default run also benchmarks FLA `chunk_kda` and `chunk_gated_delta_rule`
+on NPU with the same operator options as the CUDA benchmark. FLA uses FP32 initial
+and final states. `chunk_kda` enables gate activation, Q/K normalization and
+beta sigmoid inside the operator; GDN uses a separate scalar gate per head
+and is a different recurrence. Both use `transpose_state_layout=True`.
+GDN expects activated inputs: its scalar log-decay is `logsigmoid(randn)` and
+its beta is `sigmoid(beta_logits)`, computed outside the timed callable.
+This intentionally differs from CUDA's raw normal GDN gate/beta, which can
+produce Inf/NaN at 8192 tokens. Shapes, state buffers and operator flags match;
+the resulting GDN timings use different input values. KDA inputs are unchanged.
+`bench.sh` pins FLA to commit
+`15396e604df6a4699950d7f20457b391b0cd8e74` and installs Triton Ascend 3.2.2
+from the official Ascend package index. FLA 0.5.2 lacks the Ascend GLA output backend
+required by KDA, and Triton Ascend 3.2.0 lacks compiler options used by the
+new backend. The benchmark checks these capabilities before launching kernels.
+Keep backend dispatch enabled (`FLA_DISABLE_BACKEND_DISPATCH` must be unset).
+The script preserves the host's PyTorch, `torch_npu` and CANN installation;
+Triton Ascend 3.2.2 supports `torch_npu==2.7.1.post8` with CANN 9.1.0.
+For offline installation, set `TRITON_ASCEND_WHEEL` to a downloaded official
+3.2.2 wheel matching the host's Python and CPU architecture.
+`--skip-fla` also skips installing FLA/Triton dependencies.
+Dependency, compilation and execution errors propagate; `--skip-fla` explicitly
+selects FlashKDA-only benchmarking.
 The script defaults to `H=96`, 30 warmups, 200 iterations, and 5 repeats;
 `--gate-dtype` accepts `bf16`, matching the CUDA public contract.
 `--require-native` remains accepted for compatibility; native execution is
@@ -214,13 +236,15 @@ always required. The report filename/device label does
 not change the RTC hardware target.
 
 Caller state buffers and their dtype conversions are prepared outside the timed
-callable; internal AscendC conversions and allocations remain inside it. Each
-variant reports the backend (`ascendc`), device-event
-latency, and mean wall latency per call. An untimed preflight checks that outputs
+callable; FP32 initial states use `arange -> BF16 -> FP32`, as on CUDA.
+Internal conversions and allocations remain inside the timed callable. Each
+variant reports device-event latency. An untimed preflight checks that outputs
 and requested final states are finite. `--state` selects one state variant;
 `--T` overrides the fixed sequence length and `--seq-lens` overrides packed
 lengths. JSON output preserves backend, timing, launch/group and padding
-metadata, and Markdown reports label each variant's backend. Wrapper packing,
+metadata and dependency versions. JSON distinguishes FlashKDA from the two FLA implementations.
+Markdown reports compare FlashKDA FP32-state mean latency with FLA KDA/GDN
+and their speedups, using the same columns as the CUDA report. Wrapper packing,
 metadata transfer and copying are included in the timed callable.
 
 ## Precision
@@ -235,9 +259,7 @@ ordinary final-state cases. Gate-extreme final states use relative RMS error
 below 0.5%, since weak decay accumulates bf16 rounding.
 
 The CUDA-size numerical matrix uses an independent CPU fp64 chunked solution
-of the same recurrence. Its algebra is checked against the token recurrence,
-including tiny/zero norms, empty sequences, non-default scale and extreme
-gate/bias distributions. Output and final-state relative RMS error must be
+of the same recurrence. Output and final-state relative RMS error must be
 below 0.5% (0.6% for packed outputs, matching the packed gate-sweep budget).
 With CUDA's large `arange` initial states, output error may reach 1%
 in the initial transient: BF16 Cube operands amplify
@@ -298,14 +320,8 @@ CPU; CPU and CUDA random engines produce different bytes. Existing native
 diagnostic fixtures and their pointwise/bitwise assertions remain in place.
 Every numerical test checks that the persistent AscendC kernel launched.
 
-`test_contract.py` checks the public tensor contract, unsupported shapes,
-state dtype consistency, buffer identity and exception propagation. Contract
-tests run with metadata doubles
-on CPU hosts and with real NPU tensors when available; native numerical tests
-are skipped on hosts without an NPU. The lower-level tests also cover FP32
-gates, which are internal to AscendC rather than public API inputs.
-`test_reference.py` checks the fp64 oracle and verifies the matrix constants
-and pytest parametrization against CUDA's source through AST comparison,
-without importing CUDA-only helpers. Reference implementations and test
-helpers are in `tests/torch_ref.py`. As with the CUDA suite, tests run from a repository
+Native numerical tests are skipped on hosts without an NPU. The lower-level
+tests also cover FP32 gates, which are internal to AscendC rather than public
+API inputs. Reference implementations and test helpers are in
+`tests/torch_ref.py`. As with the CUDA suite, tests run from a repository
 checkout rather than installed as part of the package.

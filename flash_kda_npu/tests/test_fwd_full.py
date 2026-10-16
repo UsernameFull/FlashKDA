@@ -3,7 +3,7 @@
 Case names, parameters and state construction mirror tests/test_fwd_full.py.
 CUDA's instruction-matching torch.equal oracle is replaced by independent CPU
 FP64 arithmetic with explicit BF16 error budgets (see README). Native-specific
-pointwise and bitwise checks remain in test_fwd.py; validation in test_contract.py.
+pointwise and bitwise checks remain in test_fwd.py.
 """
 import pytest
 import torch

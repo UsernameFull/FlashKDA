@@ -3,8 +3,8 @@
 Run ``bench_fwd.py`` twice (default ``H`` and ``--H 64``), parse stdout, and
 write a benchmark markdown report.
 
-Reports mean latency for the three flash_kda state variants (bf16 / none /
-fp32).  Generated date is UTC, day precision only (YYYY-MM-DD).
+Reports mean latency for flash_kda (fp32 state), FLA chunk_kda and
+chunk_gated_delta_rule, plus speedups. Generated date is UTC (YYYY-MM-DD).
 """
 from __future__ import annotations
 
@@ -20,6 +20,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 BENCH_FWD = Path(__file__).resolve().parent / "bench_fwd.py"
 DEFAULT_OUT = REPO_ROOT / "BENCHMARK_A3.md"
 DEFAULT_DEVICE_LABEL = "Ascend / A3"
+
+FLA_CHUNK_KDA_OPTIONS_MD = (
+    "- `fla_chunk_kda` configuration: `use_gate_in_kernel=True`, "
+    "`use_qk_l2norm_in_kernel=True`, `use_beta_sigmoid_in_kernel=True`, "
+    "`lower_bound=-5`, `transpose_state_layout=True`"
+)
+FLA_CHUNK_GDN_OPTIONS_MD = (
+    "- `fla_chunk_gated_delta_rule` configuration: scalar per-head gate "
+    "`g=logsigmoid(randn)` of shape `(1, T, H)`, preactivated "
+    "`beta=sigmoid(beta_logits)`, `use_qk_l2norm_in_kernel=True`, "
+    "`transpose_state_layout=True`"
+)
 
 RE_HEADER_FIXED = re.compile(
     r"^shape=\[(\d+),(\d+),(\d+)\] warmup=(\d+) iters=(\d+) repeats=(\d+)\s*$"
@@ -102,6 +114,10 @@ def parse_stdout(text: str) -> list[dict]:
                 if key in name:
                     current[field] = float(mean)
                     current[field.replace("_mean_ms", "_backend")] = backend
+            if name == "chunk_kda":
+                current["chunk_mean_ms"] = float(mean)
+            elif name == "chunk_gated_delta_rule":
+                current["gdn_mean_ms"] = float(mean)
 
     if current is not None:
         cases.append(current)
@@ -136,6 +152,12 @@ def _fmt_ms(x: float | None) -> str:
     return "—" if x is None else f"{x:.4f}"
 
 
+def _fmt_speedup(flash: float | None, baseline: float | None) -> str:
+    if flash is None or flash <= 0 or baseline is None:
+        return "—"
+    return f"{baseline / flash:.2f}×"
+
+
 def _argv_with_h(argv: list[str], h: int) -> list[str]:
     out: list[str] = []
     i = 0
@@ -155,16 +177,18 @@ def _argv_with_h(argv: list[str], h: int) -> list[str]:
 
 def _render_table_block(cases: list[dict]) -> list[str]:
     lines: list[str] = [
-        "| Case | bf16 state (ms) | no state (ms) | fp32 state (ms) | Backends (bf16 / none / fp32) |",
-        "|------|----------------:|---------------:|----------------:|------------------------------|",
+        "| Case | `flash_kda` mean (ms) | `fla_chunk_kda` mean (ms) | "
+        "Speedup vs `chunk_kda` | `fla_chunk_gdn` mean (ms) | Speedup vs `gdn` |",
+        "|------|----------------------:|----------------------:|--------:|----------------------:|--------:|",
     ]
     for c in cases:
         cell = _case_detail(c).replace("|", "\\|")
+        flash = c.get("fp32_mean_ms")
+        chunk, gdn = c.get("chunk_mean_ms"), c.get("gdn_mean_ms")
+
         lines.append(
-            f"| {cell} | {_fmt_ms(c['bf16_mean_ms'])} |"
-            f" {_fmt_ms(c['nostate_mean_ms'])} |"
-            f" {_fmt_ms(c['fp32_mean_ms'])} | "
-            + " / ".join(c.get(f"{key}_backend", "—") for key in ("bf16", "nostate", "fp32")) + " |"
+            f"| {cell} | {_fmt_ms(flash)} | {_fmt_ms(chunk)} | {_fmt_speedup(flash, chunk)} |"
+            f" {_fmt_ms(gdn)} | {_fmt_speedup(flash, gdn)} |"
         )
     lines.append("")
     return lines
@@ -190,6 +214,11 @@ def render_markdown(sections: list[list[dict]], generated_at: str,
             f"- Benchmark settings: `warmup={c0['warmup']}`, `iters={c0['iters']}`, "
             f"`repeats={c0['repeats']}`"
         )
+        lines.append("")
+        lines.append("- `flash_kda` uses FP32 initial and final state; latency uses device events.")
+        lines.append(FLA_CHUNK_KDA_OPTIONS_MD)
+        lines.append(FLA_CHUNK_GDN_OPTIONS_MD)
+        lines.append("- GDN input activation is outside timing. CUDA's benchmark uses raw normal gate/beta; these can overflow on long sequences, so GDN timings use different input values.")
         lines.append("")
 
     for cases in sections:
