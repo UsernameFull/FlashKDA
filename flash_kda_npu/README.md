@@ -172,6 +172,34 @@ Grids below 256 chunks retain one chunk per subcore. `KDA_PRE_UNROLL` overrides
 the automatic choice; the selected value is reported as `pre_unroll` in the
 last-call profile and benchmark JSON.
 
+For unequal packed sequences, persistent scheduling first estimates the existing
+head stride map, including single-head tails that lose engine overlap. It also
+compares grouping heads by similar recurrence length, with longer groups first.
+The model includes block startup and requires a gain of at least 16 chunk steps
+and 5% before selecting a new map. Equal chunk counts retain the existing picker.
+The explicit head map is appended to the existing sequence metadata and uploaded
+with it; no separate map allocation, copy or kernel launch is added. Each head's
+FP32 recurrence and final-state destination stay the same.
+
+Both decisions are cached by shape, core count and head cap (128 entries each).
+`KDA_PERSIST_HEAD_MAP=auto` is the default; `stride` retains the previous mapping
+and `grouped` forces the candidate for controlled experiments.
+`KDA_PERSIST_LOOP_BLOCKS` still overrides the grid size. The last-call profile
+and benchmark JSON report `persistent_blocks` and `persistent_head_map`.
+The model is a heuristic: warm-cache gains do not include an uncached host
+planning cost on every call, and performance needs separate validation on
+hardware with a different core count.
+
+To sweep both scheduling knobs and check bitwise output/final-state agreement:
+
+```bash
+python -m flash_kda_npu.benchmarks.bench_schedule --json /tmp/kda-schedule.json
+# Optional: --heads 32 --seq-lens 0 1 64 7000 63 1064
+```
+
+The sweep uses FP32 state, NPU events for end-to-end timing, and separate
+synchronized host measurements for stage medians. Solve overlap stays enabled.
+
 Warm up before benchmarking to exclude first-use RTC compilation and
 mask/identity initialization. For native execution analysis, set `KDA_PROFILE=1`
 and inspect `flash_kda_npu.ops.ascendc.get_last_profile()` after a call.

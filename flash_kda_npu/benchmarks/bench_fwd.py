@@ -124,6 +124,8 @@ def run_case(seq_lens, H, D, warmup, iters, repeats, gate_dtype,
                          sequence_groups=profile.get("sequence_groups", 1),
                          packed_direct=profile.get("packed_direct", False),
                          pre_unroll=profile.get("pre_unroll"),
+                         persistent_blocks=profile.get("persistent_blocks"),
+                         persistent_head_map=profile.get("persistent_head_map"),
                          input_packing=profile.get("input_packing", False),
                          padded_tokens=profile.get("padded_tokens", total), **timing))
     if fla_functions is not None:

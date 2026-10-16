@@ -8,3 +8,4 @@ build/**
 **/__pycache__/**
 .clangd
 plot*.png
+flash_kda_npu/lib/

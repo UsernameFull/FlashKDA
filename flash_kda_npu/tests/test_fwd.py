@@ -125,6 +125,39 @@ def test_native_pre_gram_schedule(cores, before, after):
     assert _pre_gram_unroll(12288, 24) == 64
 
 
+@pytest.mark.parametrize("cores", [20, 24, 32])
+def test_native_varlen_persistent_schedule(cores):
+    from flash_kda_npu.ops.ascendc import _persistent_varlen_blocks
+    # A long sequence mixed with short sequences leaves single-head tails
+    # in the old three-head stride map. Four heads retain more overlap.
+    assert _persistent_varlen_blocks((21, 9, 32, 16, 5, 48), 96, cores, 4, 192) == 144
+    # Equal-length and all-empty batches preserve the existing choice.
+    assert _persistent_varlen_blocks((16,) * 8, 96, cores, 4, 256) == 256
+    assert _persistent_varlen_blocks((0,) * 8, 96, cores, 4, 256) == 256
+    for counts in ((0, 1, 0, 5, 1, 0, 2, 0), (1, 1000), (9, 2, 4)):
+        for heads in (1, 3, 17, 96):
+            bh = len(counts) * heads
+            default = (bh + 3) // 4
+            nb = _persistent_varlen_blocks(counts, heads, cores, 4, default)
+            assert 1 <= nb <= bh and (bh + nb - 1) // nb <= 4
+
+
+@pytest.mark.parametrize("counts,heads,default", [
+    ((21, 9, 32, 16, 5, 48), 96, 144),
+    ((0, 1, 1, 110, 1, 17), 32, 96),
+])
+def test_native_grouped_persistent_plan(counts, heads, default):
+    from flash_kda_npu.ops.ascendc import _persistent_grouped_plan
+    nb, rows = _persistent_grouped_plan(counts, heads, 20, 4, default)
+    assert rows and len(rows) == nb
+    assert sorted(h for row in rows for h in row if h >= 0) == list(range(len(counts) * heads))
+    assert all(len(row) == 4 and any(h >= 0 for h in row) for row in rows)
+    work = [max(counts[h // heads] for h in row if h >= 0) for row in rows]
+    assert work == sorted(work, reverse=True)
+    assert _persistent_grouped_plan((16,) * 8, 96, 20, 4, 256) == (256, ())
+    assert _persistent_grouped_plan((0, 1, 0, 5, 1, 0, 2, 0), 17, 20, 4, 34) == (34, ())
+
+
 @pytest.mark.parametrize("unroll", [1, 3, 8])
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_native_head_parameters(monkeypatch, unroll, with_bias):
@@ -373,10 +406,12 @@ def test_native_varlen_matches_independent_sequences():
 @pytest.mark.parametrize("heads", [1, 3, 7, 17])
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("unroll", [1, 3])
-def test_native_varlen_direct_buffers(monkeypatch, heads, state_dtype, unroll):
+@pytest.mark.parametrize("head_map", ["auto", "stride", "grouped"])
+def test_native_varlen_direct_buffers(monkeypatch, heads, state_dtype, unroll, head_map):
     """Mixed head schedules retire independently, with no full-input packing."""
     from flash_kda_npu.ops import ascendc
     monkeypatch.setenv("KDA_PRE_UNROLL", str(unroll))
+    monkeypatch.setenv("KDA_PERSIST_HEAD_MAP", head_map)
     lengths = [0, 1, 0, ascendc.CHUNK * 4 + 3, 7, 0, ascendc.CHUNK + 1, 0]
     steps = sum(lengths)
     q, k, v, g, beta, a_log, bias = make_inputs(1, steps, heads, "npu")
@@ -404,6 +439,8 @@ def test_native_varlen_direct_buffers(monkeypatch, heads, state_dtype, unroll):
     profile = ascendc.get_last_profile()
     assert profile["packed_direct"] and not profile["input_packing"]
     assert profile["pre_unroll"] == unroll
+    if head_map != "auto":
+        assert profile["persistent_head_map"] == head_map
     assert profile["sequence_groups"] == 1
     assert profile["launch_counts"]["kda_pre_gram_mix"] == 1
     assert profile["launch_counts"]["kda_k2_persistent_loop"] == 1

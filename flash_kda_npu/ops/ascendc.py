@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import math
+import heapq
 import struct
 import os
 import time
-from functools import wraps
+from functools import lru_cache, wraps
 from pathlib import Path
 
 import torch
@@ -174,6 +175,130 @@ def _pre_gram_unroll(c: int, cores: int) -> int:
         if best_cost is None or cost < best_cost:
             best_cost, best_u = cost, u
     return best_u
+
+
+@lru_cache(maxsize=128)
+def _persistent_varlen_blocks(counts: tuple[int, ...], heads: int, cores: int,
+                              max_heads: int, default: int) -> int:
+    """Estimate the existing stride map, including its single-head tails.
+
+    A head alone loses the depth-one protocol's engine overlap. Charge its
+    unmatched tail twice, then simulate blocks retiring on the available
+    Cubes. Fixed/equal-length batches retain the established wave picker.
+    Only compare a bounded set of head counts and nearby whole-wave grids.
+    """
+    if len(set(counts)) <= 1:
+        return default
+    bh = len(counts) * heads
+    lower = (bh + max_heads - 1) // max_heads
+    candidates = {default}
+    for mh in range(2, max_heads + 1):
+        nb = (bh + mh - 1) // mh
+        candidates.update((nb, nb // cores * cores, (nb + cores - 1) // cores * cores))
+
+    def cost(nb):
+        slots = [0] * cores
+        # The stride map changes only where a sequence boundary crosses a
+        # block index. Evaluate each constant run once rather than sorting
+        # the same head lengths separately for every block.
+        boundaries = sorted({0, nb, *(seq * heads % nb
+                                    for seq in range(1, len(counts) + 1))})
+        for start, end in zip(boundaries, boundaries[1:]):
+            work = sorted((counts[i // heads] for i in range(start, bh, nb)),
+                          reverse=True)
+            tail = work[0] - (work[1] if len(work) > 1 else 0)
+            weight = sum(work) + tail
+            remaining = end - start
+            if weight == 0:
+                continue
+            # Once all cores are within one job of each other, a complete
+            # wave adds the same duration to every core.
+            while remaining and max(slots) - slots[0] > weight:
+                ready = heapq.heappop(slots)
+                heapq.heappush(slots, ready + weight)
+                remaining -= 1
+            waves, remaining = divmod(remaining, cores)
+            if waves:
+                slots = [ready + waves * weight for ready in slots]
+            for _ in range(remaining):
+                ready = heapq.heappop(slots)
+                heapq.heappush(slots, ready + weight)
+        return max(slots)
+
+    return min((nb for nb in candidates if lower <= nb <= bh),
+               key=lambda nb: (cost(nb), nb != default, nb))
+
+
+def _persistent_fixed_blocks(bh: int, cores: int) -> int:
+    best = None
+    for mh in range(1, PERSIST_MAXH + 1):
+        if mh == 1 and bh > cores:
+            continue
+        nb = (bh + mh - 1) // mh
+        steps = -(-nb // cores) * mh
+        if best is None or steps <= best[0]:
+            best = (steps, mh)
+    return bh if bh <= cores else (bh + best[1] - 1) // best[1]
+
+
+@lru_cache(maxsize=128)
+def _persistent_grouped_plan(counts: tuple[int, ...], heads: int, cores: int,
+                             cap: int, default: int, override: int = 0,
+                             force: bool = False):
+    """Group similar recurrence lengths and launch long blocks first.
+
+    Estimate the existing depth-one protocol's single-head tails and block
+    startup on a greedy Cube schedule. Require a useful margin before paying
+    for an explicit map. The returned rows append to the sequence metadata,
+    so the schedule needs no additional allocation or device upload.
+    """
+    if len(set(counts)) <= 1 and not force:
+        return default, ()
+    bh = len(counts) * heads
+    sequence_order = sorted(range(len(counts)), key=lambda seq: -counts[seq])
+    order = [h for seq in sequence_order for h in range(seq * heads, (seq + 1) * heads)]
+    ordered_work = [counts[h // heads] for h in order]
+    prefix = [0]
+    for work in ordered_work:
+        prefix.append(prefix[-1] + work)
+
+    def grouped_score(nb):
+        # Prefix sums avoid rebuilding/sorting every candidate's head groups.
+        slots = [0] * cores
+        width, extra = divmod(bh, nb)
+        start = 0
+        for b in range(nb):
+            size = width + (b < extra)
+            end = start + size
+            tail = ordered_work[start] - (ordered_work[start + 1] if size > 1 else 0)
+            weight = 1 + prefix[end] - prefix[start] + tail
+            ready = heapq.heappop(slots)
+            heapq.heappush(slots, ready + weight)
+            start = end
+        return max(slots)
+
+    slots = [0] * cores
+    for b in range(default):
+        work = sorted((counts[h // heads] for h in range(b, bh, default)), reverse=True)
+        weight = 1 + sum(work) + work[0] - (work[1] if len(work) > 1 else 0)
+        ready = heapq.heappop(slots)
+        heapq.heappush(slots, ready + weight)
+    baseline = max(slots)
+    candidates = ({override} if override else
+                  {default, *((bh + nh - 1) // nh for nh in range(2, cap + 1))})
+    scores = {nb: grouped_score(nb) for nb in candidates}
+    nb = min(candidates, key=lambda n: (scores[n], n))
+    gain = baseline - scores[nb]
+    if not force and gain < max(16, baseline / 20):
+        return default, ()
+    width, extra = divmod(bh, nb)
+    start = 0
+    rows = []
+    for b in range(nb):
+        size = width + (b < extra)
+        rows.append(tuple(order[start:start + size] + [-1] * (4 - size)))
+        start += size
+    return nb, tuple(rows)
 
 
 def _pack_ptrs(xs):
@@ -355,7 +480,7 @@ _SOURCES: list[tuple[str, str, list[int]]] = [
     ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_wide.cpp", "kda_solve_wu_wide", [8] * 4 + [4]),
     ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_assemble.cpp", "kda_solve_assemble", [8] * 2 + [4]),
     ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_cube.cpp", "kda_solve_wu_cube_kernel", [8] * 5 + [4]),
-    ("flash_kda_npu/csrc/ascendc/fwd_kernel2_persistent.cpp", "kda_k2_persistent_loop", [8] * 16 + [4] * 8),
+    ("flash_kda_npu/csrc/ascendc/fwd_kernel2_persistent.cpp", "kda_k2_persistent_loop", [8] * 17 + [4] * 8),
 ]
 if SOLVE_FUSE:
     _SOURCES = [entry for entry in _SOURCES if entry[1] not in (
@@ -542,6 +667,8 @@ def kda_bt16_fwd_ascendc(
         scale = D ** -0.5
     nt = (t + CHUNK - 1) // CHUNK
     sequence_meta = None
+    head_map = None
+    planned_nblk = None
     total_chunks = b * nt
     if sequence_offsets is not None:
         records = []
@@ -553,7 +680,25 @@ def kda_bt16_fwd_ascendc(
             total_chunks += count
             nt = max(nt, count)
         records.append((t, 0, total_chunks, 0))
-        sequence_meta = torch.tensor(records, dtype=torch.int64, device=q.device)
+        mapping_rows = ()
+        mode = os.environ.get("KDA_PERSIST_HEAD_MAP", "auto")
+        if mode not in ("auto", "stride", "grouped"):
+            raise ValueError("KDA_PERSIST_HEAD_MAP must be auto, stride or grouped")
+        if mode != "stride":
+            counts = tuple(record[3] for record in records[:-1])
+            cores = _aic_core_count(q.device)
+            default = _persistent_varlen_blocks(
+                counts, h, cores, PERSIST_MAXH, _persistent_fixed_blocks(sequences * h, cores))
+            want_blocks = int(os.environ.get("KDA_PERSIST_LOOP_BLOCKS", "0"))
+            override = want_blocks if 0 < want_blocks <= sequences * h else 0
+            if override:
+                override = max(override, (sequences * h + PERSIST_MAXH - 1) // PERSIST_MAXH)
+                default = override
+            planned_nblk, mapping_rows = _persistent_grouped_plan(
+                counts, h, cores, PERSIST_MAXH, default, override, mode == "grouped")
+        sequence_meta = torch.tensor(records + list(mapping_rows), dtype=torch.int64, device=q.device)
+        if mapping_rows:
+            head_map = sequence_meta[sequences + 1:]
     bh = sequences * h
     c = total_chunks * h
     tasks = bh * NV
@@ -669,25 +814,19 @@ def kda_bt16_fwd_ascendc(
     # when requested. The whole recurrence is a single MIX launch. The block
     # count must keep the head map total: nblk * MAXH >= bh.
     aic_cores = _aic_core_count(q.device)
-    # Pick the heads per block: minimize whole waves x heads, ties to the
-    # larger block count; one head per block only while it fits a single
-    # wave.
-    best = None
-    for mh in range(1, PERSIST_MAXH + 1):
-        if mh == 1 and bh > aic_cores:
-            continue
-        nb = (bh + mh - 1) // mh
-        steps = -(-nb // aic_cores) * mh
-        if best is None or steps <= best[0]:
-            best = (steps, mh)
-    maxh = best[1]
+    default_nblk = _persistent_fixed_blocks(bh, aic_cores)
+    if sequence_offsets is not None:
+        default_nblk = _persistent_varlen_blocks(
+            tuple(record[3] for record in records[:-1]), h, aic_cores,
+            PERSIST_MAXH, default_nblk)
     want = int(os.environ.get("KDA_PERSIST_LOOP_BLOCKS", "0"))
-    nblk = want if 0 < want <= bh else (bh if bh <= aic_cores
-                                        else (bh + maxh - 1) // maxh)
+    nblk = want if 0 < want <= bh else default_nblk
     # The stride map is total as long as ceil(bh / nblk) fits the array
     # cap *PERSIST_MAXH*, not the heads the picker chose - so a `want`
     # below the picked heads-per-block stays legal.
     nblk = max(nblk, (bh + PERSIST_MAXH - 1) // PERSIST_MAXH)
+    if planned_nblk is not None:
+        nblk = planned_nblk
     state_output = None
     if output_final_state:
         state_output = (final_state.view(tasks, BV, D) if final_state is not None
@@ -714,7 +853,7 @@ def kda_bt16_fwd_ascendc(
     mark("k2_start")
     _launch("kda_k2_persistent_loop", nblk,
             _pack_ptrs([U, W, qg, aqk16, kg, decay, d1, d2, d3, d4f,
-                        out_public, vnew_t, h0, state_output, s16, sequence_meta]) +
+                        out_public, vnew_t, h0, state_output, s16, sequence_meta, head_map]) +
             [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale), _i(h),
              _i(state_output is not None and state_output.dtype == torch.bfloat16), _i(t)], stream)
     finish("k2_ms", "k2_start")
@@ -727,6 +866,7 @@ def kda_bt16_fwd_ascendc(
     _LAST_PROFILE.update(sequence_groups=1, real_tokens=b * t,
                          padded_tokens=total_chunks * CHUNK, input_packing=False,
                          sequence_count=sequences, packed_direct=sequence_meta is not None,
-                         pre_unroll=pre_unroll)
+                         pre_unroll=pre_unroll, persistent_blocks=nblk,
+                         persistent_head_map="grouped" if head_map is not None else "stride")
     return out_public, final_state
 
