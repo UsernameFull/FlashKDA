@@ -105,6 +105,26 @@ def test_native_batched(batch, steps, heads):
     check_native(batch, steps, heads)
 
 
+@pytest.mark.parametrize("cores,before,after", [
+    (20, 4096, 4192), (20, 12288, 12576),
+    (24, 8192, 8384), (24, 12288, 12576),
+    (32, 8192, 8384), (32, 12288, 12576),
+])
+def test_native_pre_gram_schedule(cores, before, after):
+    """A small tail must not turn a few waves into thousands of tiny blocks."""
+    from flash_kda_npu.ops.ascendc import _pre_gram_unroll
+    old_u = _pre_gram_unroll(before, cores)
+    new_u = _pre_gram_unroll(after, cores)
+    assert 32 <= old_u <= 88 and 32 <= new_u <= 88
+    old_grid = (before + 2 * old_u - 1) // (2 * old_u)
+    new_grid = (after + 2 * new_u - 1) // (2 * new_u)
+    assert new_grid <= 2 * old_grid
+    # Both fixed shapes already had efficient schedules; retain those
+    # choices when startup and compute costs tie on this 24-core device.
+    assert _pre_gram_unroll(8192, 24) == 57
+    assert _pre_gram_unroll(12288, 24) == 64
+
+
 @pytest.mark.parametrize("unroll", [1, 3, 8])
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_native_head_parameters(monkeypatch, unroll, with_bias):
@@ -383,6 +403,7 @@ def test_native_varlen_direct_buffers(monkeypatch, heads, state_dtype, unroll):
     assert calls == [(q.data_ptr(), out.data_ptr(), final.data_ptr())]
     profile = ascendc.get_last_profile()
     assert profile["packed_direct"] and not profile["input_packing"]
+    assert profile["pre_unroll"] == unroll
     assert profile["sequence_groups"] == 1
     assert profile["launch_counts"]["kda_pre_gram_mix"] == 1
     assert profile["launch_counts"]["kda_k2_persistent_loop"] == 1

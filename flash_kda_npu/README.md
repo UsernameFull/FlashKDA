@@ -166,6 +166,12 @@ of the configured size (16, 32 or 64), with neutral state transitions in
 invalid rows. Fixed-length input tails are filled on chip, without packing
 the full Q/K/V/g inputs or copying a temporary output back.
 
+Pre-Gram automatically balances chunk work and block startup across whole
+Cube waves, avoiding very small unroll values for marginal compute savings.
+Grids below 256 chunks retain one chunk per subcore. `KDA_PRE_UNROLL` overrides
+the automatic choice; the selected value is reported as `pre_unroll` in the
+last-call profile and benchmark JSON.
+
 Warm up before benchmarking to exclude first-use RTC compilation and
 mask/identity initialization. For native execution analysis, set `KDA_PROFILE=1`
 and inspect `flash_kda_npu.ops.ascendc.get_last_profile()` after a call.

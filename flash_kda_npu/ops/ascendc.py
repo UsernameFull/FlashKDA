@@ -157,15 +157,22 @@ def _solve_slice_chunks(c_solve: int, unit: int, nch: int, aiv_cores: int,
 
 
 def _pre_gram_unroll(c: int, cores: int) -> int:
-    """Chunks per pre_gram block: search all sizes for the fewest wave steps."""
+    """Balance chunk work and block startup across whole Cube waves."""
     if c < 256:
         return 1
-    best_u, best_steps = 1, None
+    best_u, best_cost = 1, None
     for u in range(88, 0, -1):
         grid = -(-c // (2 * u))
-        steps = -(-grid // cores) * u
-        if best_steps is None or steps < best_steps:
-            best_steps, best_u = steps, u
+        waves = -(-grid // cores)
+        steps = waves * u
+        # A wave also pays block initialization and pipeline fill/drain.
+        # Approximate that fixed cost by one chunk step: minimizing steps
+        # alone can replace a few long-lived blocks with thousands of tiny
+        # blocks for a negligible arithmetic saving. Keep fewer steps on
+        # equal cost so startup savings do not add needless padded work.
+        cost = (steps + waves, steps)
+        if best_cost is None or cost < best_cost:
+            best_cost, best_u = cost, u
     return best_u
 
 
@@ -719,6 +726,7 @@ def kda_bt16_fwd_ascendc(
         _LAST_PROFILE = prof
     _LAST_PROFILE.update(sequence_groups=1, real_tokens=b * t,
                          padded_tokens=total_chunks * CHUNK, input_packing=False,
-                         sequence_count=sequences, packed_direct=sequence_meta is not None)
+                         sequence_count=sequences, packed_direct=sequence_meta is not None,
+                         pre_unroll=pre_unroll)
     return out_public, final_state
 
