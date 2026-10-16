@@ -105,68 +105,34 @@ def _run_ascendc(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
         )
         return
 
-    batch, steps, heads, dim = q.shape
-    offsets = (list(range(0, (batch + 1) * steps, steps)) if cu_seqlens is None
-               else _sequence_offsets(cu_seqlens, steps))
-    lengths = [b - a for a, b in zip(offsets, offsets[1:])]
-    uniform = lengths[0]
-    if uniform > 0 and uniform % ascendc.CHUNK == 0 and all(n == uniform for n in lengths):
-        # Packed equal-length sequences are already a contiguous native batch.
-        shape = (len(lengths), uniform, heads, dim)
+    offsets = tuple(_sequence_offsets(cu_seqlens, q.shape[1]))
+    if q.shape[1] == 0:
+        if final_state is not None:
+            if initial_state is None:
+                final_state.zero_()
+            else:
+                final_state.copy_(initial_state)
+        ascendc._merge_profiles([], 0, 0)
+        return
+    uniform = offsets[1] - offsets[0]
+    if (uniform > 0 and uniform % ascendc.CHUNK == 0
+            and all(b - a == uniform for a, b in zip(offsets, offsets[1:]))):
+        # Equal aligned packed sequences are already a contiguous batch.
+        # Keep its metadata-free kernel indexing and head-major beta fast path.
+        shape = (len(offsets) - 1, uniform, *q.shape[2:])
         ascendc.kda_bt16_fwd_ascendc(
             q.view(shape), k.view(shape), v.view(shape), g.view(shape).float(),
             beta.view(shape[:3]).float(), scale=float(scale), out=out.view(shape),
-            A_log=A_log, bias=dt_bias, lower_bound=float(lower_bound),
             initial_state=None if initial_state is None else initial_state.float(),
-            output_final_state=final_state is not None, final_state=final_state)
+            output_final_state=final_state is not None, final_state=final_state,
+            A_log=A_log, bias=dt_bias, lower_bound=float(lower_bound))
         return
-    groups = {}
-    for sequence, (start, end) in enumerate(zip(offsets, offsets[1:])):
-        length = end - start
-        padded = (length + ascendc.CHUNK - 1) // ascendc.CHUNK * ascendc.CHUNK
-        groups.setdefault(padded, []).append((sequence, start, length))
-
-    sources = [x.view(-1, heads, dim) for x in (q, k, v, g)]
-    beta_flat = beta.view(-1, heads)
-    out_flat = out.view(-1, heads, dim)
-    profiles = []
-    # One native batch per rounded length keeps padding below one chunk per
-    # nonempty sequence, even for severely imbalanced sequence lengths.
-    for padded, sequences in groups.items():
-        if padded == 0:
-            if final_state is not None:
-                for sequence, _, _ in sequences:
-                    if initial_state is None:
-                        final_state[sequence].zero_()
-                    else:
-                        final_state[sequence].copy_(initial_state[sequence])
-            continue
-        count = len(sequences)
-        shape = (count, padded, heads, dim)
-        packed = [torch.zeros(shape, dtype=x.dtype, device=q.device) for x in sources]
-        packed_beta = torch.zeros((count, padded, heads), dtype=beta.dtype, device=q.device)
-        for row, (_, start, length) in enumerate(sequences):
-            for target, source in zip(packed, sources):
-                target[row, :length].copy_(source[start:start + length])
-            packed_beta[row, :length].copy_(beta_flat[start:start + length])
-        indices = torch.tensor([s[0] for s in sequences], dtype=torch.int64, device=q.device)
-        lengths = torch.tensor([s[2] for s in sequences], dtype=torch.int32, device=q.device)
-        state_in = (None if initial_state is None else
-                    initial_state.index_select(0, indices).float())
-        state_out = (None if final_state is None else
-                     torch.empty((count, heads, dim, dim), dtype=final_state.dtype, device=q.device))
-        result, state = ascendc.kda_bt16_fwd_ascendc(
-            *packed[:3], packed[3].float(), packed_beta.float(), scale=float(scale),
-            A_log=A_log, bias=dt_bias, lower_bound=float(lower_bound),
-            initial_state=state_in, output_final_state=final_state is not None,
-            final_state=state_out, valid_lengths=lengths)
-        profiles.append(ascendc.get_last_profile())
-        for row, (_, start, length) in enumerate(sequences):
-            out_flat[start:start + length].copy_(result[row, :length])
-        if final_state is not None:
-            final_state.index_copy_(0, indices, state)
-    ascendc._merge_profiles(profiles, sum(b - a for a, b in zip(offsets, offsets[1:])),
-                            sum(padded * len(rows) for padded, rows in groups.items()))
+    ascendc.kda_bt16_fwd_ascendc(
+        q, k, v, g.float(), beta.float(), scale=float(scale),
+        initial_state=None if initial_state is None else initial_state.float(),
+        output_final_state=final_state is not None,
+        A_log=A_log, bias=dt_bias, lower_bound=float(lower_bound),
+        out=out, final_state=final_state, sequence_offsets=offsets)
 
 
 def fwd(

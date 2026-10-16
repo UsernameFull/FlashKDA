@@ -350,6 +350,52 @@ def test_native_varlen_matches_independent_sequences():
         torch.testing.assert_close(final[seq:seq + 1], seq_final, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("heads", [1, 3, 7, 17])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("unroll", [1, 3])
+def test_native_varlen_direct_buffers(monkeypatch, heads, state_dtype, unroll):
+    """Mixed head schedules retire independently, with no full-input packing."""
+    from flash_kda_npu.ops import ascendc
+    monkeypatch.setenv("KDA_PRE_UNROLL", str(unroll))
+    lengths = [0, 1, 0, ascendc.CHUNK * 4 + 3, 7, 0, ascendc.CHUNK + 1, 0]
+    steps = sum(lengths)
+    q, k, v, g, beta, a_log, bias = make_inputs(1, steps, heads, "npu")
+    initial = make_state(len(lengths), heads, 128, state_dtype, "npu")
+    guard = 256
+    out_storage = torch.full((q.numel() + guard * 2,), 11, device="npu", dtype=q.dtype)
+    state_storage = torch.full((initial.numel() + guard * 2,), 7, device="npu", dtype=state_dtype)
+    out = out_storage[guard:-guard].view_as(q)
+    final = state_storage[guard:-guard].view_as(initial)
+    cu = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], device="npu", dtype=torch.int64)
+    calls = []
+    native = ascendc.kda_bt16_fwd_ascendc
+
+    def direct(*args, **kwargs):
+        calls.append((args[0].data_ptr(), kwargs["out"].data_ptr(), kwargs["final_state"].data_ptr()))
+        assert kwargs.get("sequence_offsets") == tuple(cu.cpu().tolist())
+        assert kwargs.get("valid_lengths") is None
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(ascendc, "kda_bt16_fwd_ascendc", direct)
+    flash_kda.fwd(q, k, v, g, beta, 128 ** -0.5, out, a_log, bias, -5.0,
+                  initial_state=initial, final_state=final, cu_seqlens=cu)
+    torch.npu.synchronize()
+    assert calls == [(q.data_ptr(), out.data_ptr(), final.data_ptr())]
+    profile = ascendc.get_last_profile()
+    assert profile["packed_direct"] and not profile["input_packing"]
+    assert profile["sequence_groups"] == 1
+    assert profile["launch_counts"]["kda_pre_gram_mix"] == 1
+    assert profile["launch_counts"]["kda_k2_persistent_loop"] == 1
+    assert profile["padded_tokens"] == sum(
+        (n + ascendc.CHUNK - 1) // ascendc.CHUNK * ascendc.CHUNK for n in lengths)
+    expected, state = recurrent_reference((q, k, v, g, beta, a_log, bias), initial, lengths)
+    assert_close(out, expected)
+    assert_close(final, state)
+    for storage, sentinel in ((out_storage, 11), (state_storage, 7)):
+        assert bool((storage[:guard] == sentinel).all())
+        assert bool((storage[-guard:] == sentinel).all())
+
+
 def test_native_varlen_long(request):
     if not request.config.getoption("--run-long"):
         pytest.skip("use --run-long for a long packed sequence with partial chunks")

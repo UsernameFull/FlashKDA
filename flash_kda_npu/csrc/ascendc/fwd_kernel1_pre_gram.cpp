@@ -436,19 +436,25 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     GM_ADDR pDecay, GM_ADDR pRk, GM_ADDR pRv, GM_ADDR pQg, GM_ADDR pKg,
     GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb, GM_ADDR pGx,
     GM_ADDR pAqk32, GM_ADDR pAqk16, GM_ADDR pL, GM_ADDR pMaskS, GM_ADDR pMaskL,
-    GM_ADDR pLengths,
+    GM_ADDR pLengths, GM_ADDR pSequences,
     int32_t B, int32_t T, int32_t H, float lower_bound, float scale, int32_t unroll,
     int32_t xRowBytes, int32_t gRowBytes) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    // Packed metadata rows: [token start, length, first chunk, chunk count].
+    // The sentinel row holds the total per-head chunk count. All heads of a
+    // sequence are contiguous in scratch; no full-input packing is needed.
+    const auto sequences = reinterpret_cast<__gm__ int64_t *>(pSequences);
+    const int32_t totalChunks = pSequences == nullptr ? B * H * ((T + M - 1) / M)
+                                                      : sequences[B * 4 + 2] * H;
     if ASCEND_IS_AIC {
-        run_gram_aic(pGa, pGk, pGb, pGx, pAqk32, pL, B * H * ((T + M - 1) / M), unroll);
+        run_gram_aic(pGa, pGk, pGb, pGx, pAqk32, pL, totalChunks, unroll);
     }
     if ASCEND_IS_AIV {
     const int32_t nt = (T + M - 1) / M;
     const DataCopyPadExtParams<bfloat16_t> padNop(false, 0, 0, 0);
     const DataCopyPadExtParams<float> padNopF(false, 0, 0, 0);
     const DataCopyPadExtParams<float> padScalar(true, 0, 7, 0);
-    const int32_t nchunk = B * H * nt;
+    const int32_t nchunk = totalChunks;
 
     TPipe pipe;
     TEventID e2v = pipe.AllocEventID<HardEvent::MTE2_V>();
@@ -479,13 +485,14 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     TQue<TPosition::VECOUT, 2> qgout, qgo16;
     TBuf<TPosition::VECCALC> bQf, bKf, bT0, bT2, bEf, bRed,
         bQnb, bKnb, bRkb, bRvb, bQgb, bKgb, bBias, bBeta, bBb, bAlog, bZz,
-        bGef, bQK, bRvo, bMfull;
+        bGef, bQK, bRvo, bMfull, bBetaIndex;
     pipe.InitBuffer(bQf, NG * 4); pipe.InitBuffer(bKf, NG * 4);
     pipe.InitBuffer(bT0, N * 4); pipe.InitBuffer(bT2, NG * 4);
     pipe.InitBuffer(bEf, NG * 4); pipe.InitBuffer(bRed, 384 * 4);
     pipe.InitBuffer(bQnb, NG * 2); pipe.InitBuffer(bKnb, NG * 2); pipe.InitBuffer(bRkb, NG * 2);
     pipe.InitBuffer(bRvb, NG * 2); pipe.InitBuffer(bQgb, NG * 2); pipe.InitBuffer(bKgb, NG * 2);
     pipe.InitBuffer(bBias, D * 4); pipe.InitBuffer(bBeta, M * 4);
+    pipe.InitBuffer(bBetaIndex, M * sizeof(uint32_t));
     // The beta broadcast only needs one 32 B block per row: Brcb leaves row k
     // at bb[8 * k] and the consumers walk it with srcRepStride = 1.
     pipe.InitBuffer(bBb, M * 8 * 4); pipe.InitBuffer(bAlog, 8 * 4);
@@ -523,6 +530,11 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     LocalTensor<bfloat16_t> rvbo = bRvo.Get<bfloat16_t>();
     LocalTensor<uint8_t> mbitsAll = bMfull.Get<uint8_t>();
     bool masksBuilt = false;
+    LocalTensor<uint32_t> betaIndex = bBetaIndex.Get<uint32_t>();
+    if (pSequences != nullptr) {
+        for (int32_t row = 0; row < M; ++row) betaIndex.SetValue(row, row * 32);
+        PipeBarrier<PIPE_ALL>();
+    }
 
     LocalTensor<bfloat16_t> qnb = bQnb.Get<bfloat16_t>(), knb = bKnb.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> rkb = bRkb.Get<bfloat16_t>(), rvb = bRvb.Get<bfloat16_t>();
@@ -572,8 +584,28 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     for (int32_t u = 0; u < unroll; ++u) {
     int32_t c = group * 2 * unroll + 2 * u + sub;
     if (c >= nchunk) c = nchunk - 1;
-    const int32_t bh = c / nt;
-    const int32_t head = bh % H;
+    int32_t sequence = c / (nt * H);
+    int32_t sequenceNt = nt;
+    int32_t localChunk = c - sequence * H * nt;
+    int64_t tokenStart = static_cast<int64_t>(sequence) * T;
+    int32_t sequenceLength = T;
+    if (pSequences != nullptr) {
+        // Find the rightmost sequence prefix <= c. Repeated prefixes are
+        // empty sequences and must be skipped, including leading empties.
+        int32_t lo = 0, hi = B;
+        while (lo + 1 < hi) {
+            const int32_t mid = lo + (hi - lo) / 2;
+            if (sequences[mid * 4 + 2] * H <= c) lo = mid;
+            else hi = mid;
+        }
+        sequence = lo;
+        tokenStart = sequences[lo * 4];
+        sequenceLength = sequences[lo * 4 + 1];
+        sequenceNt = sequences[lo * 4 + 3];
+        localChunk = c - sequences[lo * 4 + 2] * H;
+    }
+    const int32_t head = localChunk / sequenceNt;
+    const int32_t ck = localChunk % sequenceNt;
     const bool headChanged = head != cachedHead;
     const uint64_t m0 = static_cast<uint64_t>(c) * M * M;
     const uint64_t x0 = static_cast<uint64_t>(c) * N;
@@ -584,16 +616,16 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // layout instead of a packed [c, M, D] copy: one token is D contiguous
     // elements and consecutive tokens of a chunk sit H*D elements apart.
     // The downstream buffers keep the packed order.
-    const int32_t b = bh / H;
-    const int32_t ck = c - bh * nt;
-    const int32_t physicalRows = T - ck * M;
+    const int32_t b = sequence;
+    const int32_t physicalRows = sequenceLength - ck * M;
     int32_t validRows = physicalRows < M ? physicalRows : M;
     if (pLengths != nullptr) {
         const int32_t remaining = reinterpret_cast<__gm__ int32_t *>(pLengths)[b] - ck * M;
         const int32_t logicalRows = remaining < 0 ? 0 : remaining;
         if (logicalRows < validRows) validRows = logicalRows;
     }
-    const uint64_t xb = (static_cast<uint64_t>(b) * T + static_cast<uint64_t>(ck) * M) *
+    const uint64_t token = tokenStart + static_cast<int64_t>(ck) * M;
+    const uint64_t xb = token *
                             static_cast<uint64_t>(H) * D +
                         static_cast<uint64_t>(head) * D;
 
@@ -613,7 +645,14 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
         DataCopyPad(alog, Alog[head], DataCopyExtParams(1, sizeof(float), 0, 0, 0),
                     padScalar);
     }
-    DataCopy(beta, Beta[cm], DataCopyParams(1, M / 8, 0, 0));
+    if (pSequences == nullptr) {
+        DataCopy(beta, Beta[cm], DataCopyParams(1, M / 8, 0, 0));
+    } else {
+        // Read one scalar per token into 32-byte UB rows, then compact it
+        // with a vector gather. bb is reused for the later beta broadcast.
+        DataCopyPad(bb, Beta[token * H + head],
+                    DataCopyExtParams(validRows, sizeof(float), (H - 1) * sizeof(float), 0, 0), padScalar);
+    }
     // One set/one wait: the beta sigmoid below needs the G/log/beta loads in
     // UB, and the wait is the only consumer of this channel.
     SetFlag<HardEvent::MTE2_V>(e2vs);
@@ -624,6 +663,15 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     }
 
     WaitFlag<HardEvent::MTE2_V>(e2vs);
+    if (pSequences != nullptr) {
+        if (validRows < M) {
+            // Each staging row is 32-byte aligned, including one-token tails.
+            Duplicate(bb[validRows * 8], 0.0f, (M - validRows) * 8);
+            PipeBarrier<PIPE_V>();
+        }
+        Gather(beta, bb, betaIndex, 0, M);
+        PipeBarrier<PIPE_V>();
+    }
     Muls(beta, beta, -1.0f, M);
     Exp(beta, beta, M);
     Adds(beta, beta, 1.0f, M);
@@ -885,6 +933,12 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Mul(t2, t2, bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     Mul(t2[64], t2[64], bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     PipeBarrier<PIPE_V>();
+    if (pSequences != nullptr && hp + 1 == NP) {
+        // Packed beta reuses bb as an MTE2 landing buffer in the next
+        // chunk. The earlier Q/K/V load fence precedes this final bb read.
+        SetFlag<HardEvent::V_MTE2>(em2);
+        WaitFlag<HardEvent::V_MTE2>(em2);
+    }
     Cast(pgk, t2, RoundMode::CAST_RINT, NG);
     Muls(gef, zz, -LN2, NG);
     Exp(gef, gef, NG);

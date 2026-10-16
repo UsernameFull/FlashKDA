@@ -108,11 +108,12 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
     GM_ADDR pU, GM_ADDR pW, GM_ADDR pQg, GM_ADDR pAqk, GM_ADDR pKgT, GM_ADDR pDecay,
     GM_ADDR pD1, GM_ADDR pD2, GM_ADDR pD3, GM_ADDR pD4,
     GM_ADDR pOut, GM_ADDR pVnewT,
-    GM_ADDR pH0, GM_ADDR pFinal, GM_ADDR pS16,
+    GM_ADDR pH0, GM_ADDR pFinal, GM_ADDR pS16, GM_ADDR pSequences,
     int32_t BH, int32_t NT, int32_t NV, int32_t NBLK, float scale, int32_t NH,
     int32_t finalBF16, int32_t T) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     const int32_t nv = NV;
+    const auto sequences = reinterpret_cast<__gm__ int64_t *>(pSequences);
 
     if ASCEND_IS_AIC {
         const int32_t blk = static_cast<int32_t>(GetBlockIdx());
@@ -120,6 +121,20 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         int32_t nh = 0;
         for (int32_t h = blk; h < BH && nh < MAXH; h += NBLK) heads[nh++] = h;
         if (nh == 0) return;
+        // Cache the small immutable schedule once per block/engine. Reading
+        // sequence metadata in every stage of every chunk is scalar GM traffic.
+        int32_t chunkCounts[MAXH], chunkBases[MAXH], lengths[MAXH];
+        int64_t tokenStarts[MAXH];
+        int32_t blockChunks = 0;
+        for (int32_t s = 0; s < nh; ++s) {
+            const int32_t bh = heads[s], seq = bh / NH;
+            chunkCounts[s] = pSequences == nullptr ? NT : sequences[seq * 4 + 3];
+            chunkBases[s] = pSequences == nullptr ? bh * NT
+                : sequences[seq * 4 + 2] * NH + (bh % NH) * chunkCounts[s];
+            lengths[s] = pSequences == nullptr ? T : sequences[seq * 4 + 1];
+            tokenStarts[s] = pSequences == nullptr ? static_cast<int64_t>(seq) * T : sequences[seq * 4];
+            if (chunkCounts[s] > blockChunks) blockChunks = chunkCounts[s];
+        }
 
         GlobalTensor<bfloat16_t> W, Qg, Aqk, Vt, Kt, S16;
         GlobalTensor<float> D4;
@@ -159,11 +174,14 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         LocalTensor<bfloat16_t> l0a = a8.ReinterpretCast<bfloat16_t>();
         LocalTensor<bfloat16_t> l0b = b8.ReinterpretCast<bfloat16_t>();
 
-        for (int32_t chunk = 0; chunk < NT; ++chunk) {
+        for (int32_t chunk = 0; chunk < blockChunks; ++chunk) {
             // Stage 1: d1 = W @ S16^T, d2 = Qg @ S16^T for every head.
             for (int32_t s = 0; s < nh; ++s) {
                 const int32_t bh = heads[s];
-                const uint64_t a0 = static_cast<uint64_t>(bh * NT + chunk) * M * D;
+                const int32_t chunks = chunkCounts[s];
+                if (chunk >= chunks) continue;
+                const int32_t chunkBase = chunkBases[s];
+                const uint64_t a0 = static_cast<uint64_t>(chunkBase + chunk) * M * D;
                 auto lw = qw.AllocTensor<bfloat16_t>();
                 auto lg = qg.AllocTensor<bfloat16_t>();
                 auto ls = qs.AllocTensor<bfloat16_t>();
@@ -236,7 +254,10 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
             // Stage 3: d3 = Aqk @ v_new, d4 = v_new^T @ kg for every head.
             for (int32_t s = 0; s < nh; ++s) {
                 const int32_t bh = heads[s];
-                const int32_t c = bh * NT + chunk;
+                const int32_t chunks = chunkCounts[s];
+                if (chunk >= chunks) continue;
+                const int32_t chunkBase = chunkBases[s];
+                const int32_t c = chunkBase + chunk;
                 auto la = qa.AllocTensor<bfloat16_t>();
                 auto lv = qv.AllocTensor<bfloat16_t>();
                 auto lx = qx.AllocTensor<bfloat16_t>();
@@ -382,6 +403,20 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         int32_t nh = 0;
         for (int32_t h = blk; h < BH && nh < MAXH; h += NBLK) heads[nh++] = h;
         if (nh == 0) return;
+        // Cache the small immutable schedule once per block/engine. Reading
+        // sequence metadata in every stage of every chunk is scalar GM traffic.
+        int32_t chunkCounts[MAXH], chunkBases[MAXH], lengths[MAXH];
+        int64_t tokenStarts[MAXH];
+        int32_t blockChunks = 0;
+        for (int32_t s = 0; s < nh; ++s) {
+            const int32_t bh = heads[s], seq = bh / NH;
+            chunkCounts[s] = pSequences == nullptr ? NT : sequences[seq * 4 + 3];
+            chunkBases[s] = pSequences == nullptr ? bh * NT
+                : sequences[seq * 4 + 2] * NH + (bh % NH) * chunkCounts[s];
+            lengths[s] = pSequences == nullptr ? T : sequences[seq * 4 + 1];
+            tokenStarts[s] = pSequences == nullptr ? static_cast<int64_t>(seq) * T : sequences[seq * 4];
+            if (chunkCounts[s] > blockChunks) blockChunks = chunkCounts[s];
+        }
 
         GlobalTensor<bfloat16_t> Vt, S16, Out, Final16;
         GlobalTensor<float> U, D4, Decay, H0, Final32;
@@ -474,22 +509,30 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 PipeBarrier<PIPE_V>();
                 SetFlag<HardEvent::V_MTE3>(ev3);
                 WaitFlag<HardEvent::V_MTE3>(ev3);
-                DataCopy(S16[static_cast<uint64_t>(task) * S_TILE + hf * (BV / 2) * D], s16,
-                         DataCopyParams(BV / 2, D / 16, 0, 0));
+                const uint64_t offset = static_cast<uint64_t>(task) * S_TILE + hf * (BV / 2) * D;
+                DataCopy(S16[offset], s16, DataCopyParams(BV / 2, D / 16, 0, 0));
+                if (pSequences != nullptr && chunkCounts[s] == 0
+                        && pFinal != nullptr && finalBF16) {
+                    DataCopy(Final16[offset], s16, DataCopyParams(BV / 2, D / 16, 0, 0));
+                }
             }
 
             PipeBarrier<PIPE_ALL>();
         }
         for (int32_t s = 0; s < nh; ++s) {
+            if (pSequences != nullptr && chunkCounts[s] == 0) continue;
             CrossCoreSetFlag<2, PIPE_MTE3>(FL_R);   // prologue: first d12 waits
         }
 
-        for (int32_t chunk = 0; chunk < NT; ++chunk) {
+        for (int32_t chunk = 0; chunk < blockChunks; ++chunk) {
             // Stage 2: v_new = u - d1 (and its transpose) per head.
             for (int32_t s = 0; s < nh; ++s) {
                 const int32_t bh = heads[s];
+                const int32_t chunks = chunkCounts[s];
+                if (chunk >= chunks) continue;
+                const int32_t chunkBase = chunkBases[s];
                 const int32_t task = bh * nv + iv;
-                const int32_t c = bh * NT + chunk;
+                const int32_t c = chunkBase + chunk;
                 // The previous iteration's vector work may still be reading the
                 // UB staging buffers (ub/vf/vb/sc) that this iteration loads
                 // into.  A one-chunk-per-launch kernel never sees this WAR
@@ -545,8 +588,11 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
             // Stage 4: out = d2 * scale + d3 and the state recurrence.
             for (int32_t s = 0; s < nh; ++s) {
                 const int32_t bh = heads[s];
+                const int32_t chunks = chunkCounts[s];
+                if (chunk >= chunks) continue;
+                const int32_t chunkBase = chunkBases[s];
                 const int32_t task = bh * nv + iv;
-                const int32_t c = bh * NT + chunk;
+                const int32_t c = chunkBase + chunk;
                 // Same WAR hazard as stage 2: d2/d3/d4/dec, ob and s16 are all
                 // rewritten here while the previous iteration's reads of them
                 // (and its MTE3 copies out of ob/s16) may still be in flight.
@@ -575,7 +621,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 // as whole rows.  Each next quarter's load and its MTE2->V
                 // wait hide behind the current quarter's vector work exactly
                 // as the two halves did.
-                const bool nextChunk = chunk + 1 < NT;
+                const bool nextChunk = chunk + 1 < chunks;
                 const bool publish = nextChunk || (pFinal != nullptr && finalBF16);
                 for (int32_t hf = 0; hf < 4; ++hf) {
                     if (hf > 0) {
@@ -601,11 +647,10 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                         // [b, t, h, D] directly: one 4-block (128 B) run per
                         // chunk row, the next row NH * D elements further on.
                         const int32_t hh = bh - (bh / NH) * NH;
-                        const uint64_t token = static_cast<uint64_t>(bh / NH) * T +
-                                               static_cast<uint64_t>(chunk) * M;
+                        const uint64_t token = tokenStarts[s] + static_cast<uint64_t>(chunk) * M;
                         const uint64_t obase = token * NH * D +
                                                static_cast<uint64_t>(hh) * D + iv * BV;
-                        const int32_t remaining = T - chunk * M;
+                        const int32_t remaining = lengths[s] - chunk * M;
                         const int32_t rows = remaining < M ? remaining : M;
                         DataCopy(Out[obase], ob,
                                  DataCopyParams(rows, BV / 16, 0,

@@ -123,8 +123,8 @@ or silently accept other public dtypes. All fixed-length inputs pass the
 caller's input/output buffers directly to AscendC, including partial chunks.
 The pre-Gram kernel reads only valid rows and zero-fills the tail in UB; K2
 writes only valid output rows using the original batch stride. Only the small
-head-major beta buffer needs tail padding. Unequal-length packed sequences
-still use temporary native batches, then copy results into caller buffers.
+head-major beta buffer needs tail padding for fixed-length inputs. Packed
+inputs and outputs are also read and written directly, including unequal lengths.
 
 Public sequence lengths need not be chunk-aligned and may be shorter than one
 chunk. Packed boundaries must start at zero, end at `T`, and be nondecreasing;
@@ -139,20 +139,25 @@ The public dtype, state-buffer and failure contracts match CUDA, including
 fixed and variable lengths with partial chunks. Public tensor validation failures raise
 `RuntimeError`; exceptions from the native implementation retain their types.
 
-Unequal-length sequences are grouped by length rounded up to `KDA_CHUNK` and
-run as native AscendC batches. Each sequence adds fewer than one chunk of
-padding; a short sequence is never padded to the longest sequence in the input.
-For packed groups, Q/K/V padding is zero. The pre-Gram kernel explicitly sets padded gate
-log-decay to zero before its prefix sum, so padded tokens do not decay or
-update the final state. All KDA arithmetic stays in AscendC; PyTorch is used
-for packing and copying, with no PyTorch KDA fallback. Equal aligned lengths
-are reshaped directly into a native batch without packing.
+Packed sequences share one native pipeline. A small metadata table records
+each sequence's token start, valid length, chunk prefix and chunk count.
+Pre-Gram locates the sequence for each chunk on NPU, reads Q/K/V/g and beta
+from the caller's packed tensors and fills only invalid tail rows in UB.
+Intermediate chunk tensors are compact: each sequence adds fewer than one
+chunk of padding, without padding short sequences to the longest input.
+Padded gate log-decay is zero, so invalid rows neither decay nor update state.
+The persistent kernel caches each owned head's schedule, stops at that
+sequence's last chunk and writes output/final state directly to caller buffers.
+Empty sequences preserve the initial state, or return zero state.
+Equal aligned sequences retain the contiguous-batch view fast path, without
+sequence lookup or full-input copying; `packed_direct` marks the metadata path.
 
 The current packed dispatcher reads only `cu_seqlens` metadata on the host,
-which synchronizes that transfer, and launches one native pipeline per rounded
-length group. Packing, copies and metadata handling add overhead relative to
-aligned fixed-length input, especially for many distinct lengths. Include
-these costs when comparing end-to-end performance.
+which synchronizes that transfer, validates boundaries and builds the small
+device metadata table. It does not pack full input tensors, gather individual
+initial states, or copy temporary outputs back. Metadata handling, public dtype
+conversions, buffer allocation and all native launches remain inside benchmark
+timing. There is no PyTorch KDA fallback.
 
 ## Configuration and profiling
 
@@ -164,9 +169,10 @@ the full Q/K/V/g inputs or copying a temporary output back.
 Warm up before benchmarking to exclude first-use RTC compilation and
 mask/identity initialization. For native execution analysis, set `KDA_PROFILE=1`
 and inspect `flash_kda_npu.ops.ascendc.get_last_profile()` after a call.
-For packed calls it aggregates native launch counts and native stage timings
-across all groups and reports real/padded token counts; stage timings exclude
-packing and copying, whereas the benchmark includes them.
+For the metadata path it reports `packed_direct=True`, `input_packing=False`, one
+sequence group, launch counts and real/padded token counts. Native stage timings
+exclude host boundary validation and metadata construction; benchmark timings
+include that work.
 Profiling synchronizes the device and affects timing; leave it disabled for
 end-to-end benchmarks.
 
@@ -244,8 +250,8 @@ and requested final states are finite. `--state` selects one state variant;
 lengths. JSON output preserves backend, timing, launch/group and padding
 metadata and dependency versions. JSON distinguishes FlashKDA from the two FLA implementations.
 Markdown reports compare FlashKDA FP32-state mean latency with FLA KDA/GDN
-and their speedups, using the same columns as the CUDA report. Wrapper packing,
-metadata transfer and copying are included in the timed callable.
+and their speedups, using the same columns as the CUDA report. Host metadata
+handling and public dtype conversions are included in the timed callable.
 
 ## Precision
 
@@ -309,6 +315,9 @@ the persistent kernel launched. It also checks launcher ABI validation and
 device switching when two NPUs are available. It additionally mirrors CUDA's
 ten gate/bias distributions with 8192-token fixed and six-sequence packed
 inputs, using uniform Q/K/V and BF16-rounded random initial states.
+Direct packed-buffer tests verify a single pre-Gram/persistent launch, unchanged
+input/output pointers, guard regions, mixed-length head retirement, empty
+sequences and multiple pre-Gram unroll settings.
 
 `test_fwd_full.py` mirrors all 580 CUDA full-suite cases: 288 fixed-length,
 192 packed variable-length, 96 batched, and four opt-in long cases. Parameter

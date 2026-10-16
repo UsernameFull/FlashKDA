@@ -122,6 +122,7 @@ def run_case(seq_lens, H, D, warmup, iters, repeats, gate_dtype,
                          gate_dtype=str(gate_dtype), warmup=warmup, iters=iters,
                          repeats=repeats, native_launches=profile["launch_total"],
                          sequence_groups=profile.get("sequence_groups", 1),
+                         packed_direct=profile.get("packed_direct", False),
                          input_packing=profile.get("input_packing", False),
                          padded_tokens=profile.get("padded_tokens", total), **timing))
     if fla_functions is not None:

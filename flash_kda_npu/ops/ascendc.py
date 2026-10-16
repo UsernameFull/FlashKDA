@@ -344,11 +344,11 @@ def _rtc(rel: str, name: str, sizes: list[int]) -> None:
 
 
 _SOURCES: list[tuple[str, str, list[int]]] = [
-    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_pre_gram.cpp", "kda_pre_gram_mix", [8] * 22 + [4] * 8),
+    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_pre_gram.cpp", "kda_pre_gram_mix", [8] * 23 + [4] * 8),
     ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_wide.cpp", "kda_solve_wu_wide", [8] * 4 + [4]),
     ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_assemble.cpp", "kda_solve_assemble", [8] * 2 + [4]),
     ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_cube.cpp", "kda_solve_wu_cube_kernel", [8] * 5 + [4]),
-    ("flash_kda_npu/csrc/ascendc/fwd_kernel2_persistent.cpp", "kda_k2_persistent_loop", [8] * 15 + [4] * 8),
+    ("flash_kda_npu/csrc/ascendc/fwd_kernel2_persistent.cpp", "kda_k2_persistent_loop", [8] * 16 + [4] * 8),
 ]
 if SOLVE_FUSE:
     _SOURCES = [entry for entry in _SOURCES if entry[1] not in (
@@ -380,7 +380,7 @@ def _tri_masks(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     return masks
 
 
-def _check_inputs(q, k, v, g, beta, A_log, bias, initial_state):
+def _check_inputs(q, k, v, g, beta, A_log, bias, initial_state, state_sequences=None):
     if q.device.type != "npu":
         raise ValueError("AscendC v1 requires NPU tensors")
     if any(x is not None and x.device != q.device
@@ -401,8 +401,9 @@ def _check_inputs(q, k, v, g, beta, A_log, bias, initial_state):
         raise ValueError("A_log must be FP32 [H]")
     if bias is not None and (bias.shape != (h, D) or bias.dtype != torch.float32):
         raise ValueError("bias must be FP32 [H,128]")
-    if initial_state is not None and (initial_state.shape != (b, h, D, D) or initial_state.dtype != torch.float32):
-        raise ValueError("initial_state must be FP32 [B,H,128,128]")
+    sequences = b if state_sequences is None else state_sequences
+    if initial_state is not None and (initial_state.shape != (sequences, h, D, D) or initial_state.dtype != torch.float32):
+        raise ValueError("initial_state must be FP32 [N,H,128,128]")
     return b, t, h
 
 
@@ -461,6 +462,7 @@ def kda_bt16_fwd_ascendc(
     out: torch.Tensor | None = None,
     final_state: torch.Tensor | None = None,
     valid_lengths: torch.Tensor | None = None,
+    sequence_offsets: tuple[int, ...] | None = None,
 ):
     """Run an opt-in AscendC KDA path; all KDA arithmetic stays on device.
 
@@ -468,7 +470,9 @@ def kda_bt16_fwd_ascendc(
     ``beta`` and ``A_log``/``bias`` are FP32; returns ``(out, final_state)``,
     Any positive fixed sequence length is supported, including partial chunks.
     ``valid_lengths`` is internal packing metadata: counts in [0, T], with
-    zero Q/K/V beyond each count. The public dispatcher constructs these buffers.
+    zero Q/K/V beyond each count. ``sequence_offsets`` selects direct packed
+    input/output with compact per-sequence chunks; boundaries have already been
+    copied to the host for public validation, never Q/K/V/g themselves.
     """
     # Builds outside the validated set are refused before anything is compiled
     # or launched: a silently wrong answer is the one failure mode this package
@@ -501,7 +505,16 @@ def kda_bt16_fwd_ascendc(
         if profile:
             torch.npu.synchronize()
             prof[name] = (time.perf_counter() - prof[start_name]) * 1e3
-    b, t, h = _check_inputs(q, k, v, g, beta, A_log, bias, initial_state)
+    state_sequences = None
+    if sequence_offsets is not None:
+        if (len(sequence_offsets) < 2 or sequence_offsets[0] != 0
+                or sequence_offsets[-1] != q.shape[1]
+                or any(a > b for a, b in zip(sequence_offsets, sequence_offsets[1:]))
+                or q.shape[0] != 1 or valid_lengths is not None):
+            raise ValueError("invalid packed sequence offsets")
+        state_sequences = len(sequence_offsets) - 1
+    b, t, h = _check_inputs(q, k, v, g, beta, A_log, bias, initial_state, state_sequences)
+    sequences = b if state_sequences is None else state_sequences
     if valid_lengths is not None and (
             valid_lengths.shape != (b,) or valid_lengths.dtype != torch.int32
             or valid_lengths.device != q.device or not valid_lengths.is_contiguous()):
@@ -513,7 +526,7 @@ def kda_bt16_fwd_ascendc(
     if final_state is not None:
         if not output_final_state:
             raise ValueError("final_state requires output_final_state=True")
-        if (final_state.shape != (b, h, D, D)
+        if (final_state.shape != (sequences, h, D, D)
                 or final_state.dtype not in (torch.float32, torch.bfloat16)
                 or final_state.device != q.device or not final_state.is_contiguous()):
             raise ValueError(
@@ -521,8 +534,21 @@ def kda_bt16_fwd_ascendc(
     if scale is None:
         scale = D ** -0.5
     nt = (t + CHUNK - 1) // CHUNK
-    bh = b * h
-    c = bh * nt
+    sequence_meta = None
+    total_chunks = b * nt
+    if sequence_offsets is not None:
+        records = []
+        total_chunks = 0
+        nt = 0
+        for start, end in zip(sequence_offsets, sequence_offsets[1:]):
+            count = (end - start + CHUNK - 1) // CHUNK
+            records.append((start, end - start, total_chunks, count))
+            total_chunks += count
+            nt = max(nt, count)
+        records.append((t, 0, total_chunks, 0))
+        sequence_meta = torch.tensor(records, dtype=torch.int64, device=q.device)
+    bh = sequences * h
+    c = total_chunks * h
     tasks = bh * NV
     q, k, v, g, beta, A_log = [x.contiguous() for x in (q, k, v, g, beta, A_log)]
     if bias is not None:
@@ -534,7 +560,9 @@ def kda_bt16_fwd_ascendc(
     # DataCopy cannot express that gather on this part).
     qk_row_bytes = h * D * 2 - D * 2
     g_row_bytes = h * D * 4 - D * 4
-    if t % CHUNK == 0:
+    if sequence_meta is not None:
+        beta_pack = beta
+    elif t % CHUNK == 0:
         beta_pack = beta.view(b, nt, CHUNK, h).permute(0, 3, 1, 2).contiguous().view(c, CHUNK)
     else:
         # Beta already needs a head-major copy. Pad only this small scalar
@@ -585,8 +613,8 @@ def kda_bt16_fwd_ascendc(
     gram_x = torch.empty((c, max(1, CHUNK // 2), D), dtype=torch.bfloat16,
                          device=q.device)
     pre_args = _pack_ptrs(pre_head + [gram_ops[0], gram_ops[1], gram_ops[2], gram_x]
-                          + pre_tail + [valid_lengths])
-    pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
+                          + pre_tail + [valid_lengths, sequence_meta])
+    pre_args += [_i(sequences), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
                  _i(qk_row_bytes), _i(g_row_bytes)]
     # One MIX block pairs an AIC with two AIV subcores, so it covers
     # 2 * pre_unroll chunks.
@@ -679,17 +707,18 @@ def kda_bt16_fwd_ascendc(
     mark("k2_start")
     _launch("kda_k2_persistent_loop", nblk,
             _pack_ptrs([U, W, qg, aqk16, kg, decay, d1, d2, d3, d4f,
-                        out_public, vnew_t, h0, state_output, s16]) +
+                        out_public, vnew_t, h0, state_output, s16, sequence_meta]) +
             [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale), _i(h),
              _i(state_output is not None and state_output.dtype == torch.bfloat16), _i(t)], stream)
     finish("k2_ms", "k2_start")
     final_state = None if not output_final_state else (
         final_state if final_state is not None else
-        state_output.view(bh, NV, BV, D).reshape(b, h, D, D))
+        state_output.view(bh, NV, BV, D).reshape(sequences, h, D, D))
     if profile:
         prof["total_ms"] = sum(v for k, v in prof.items() if k.endswith("_ms"))
         _LAST_PROFILE = prof
     _LAST_PROFILE.update(sequence_groups=1, real_tokens=b * t,
-                         padded_tokens=b * nt * CHUNK, input_packing=False)
+                         padded_tokens=total_chunks * CHUNK, input_packing=False,
+                         sequence_count=sequences, packed_direct=sequence_meta is not None)
     return out_public, final_state
 
