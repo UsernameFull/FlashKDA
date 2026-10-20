@@ -1,4 +1,11 @@
+"""Public NPU validation and fixed/packed dispatch.
+
+Keep validation ahead of both graph replay and eager execution. The private
+execution layer is also used by explicit graph capture, without cache lookup.
+"""
 from __future__ import annotations
+
+import os
 
 from typing import Optional
 
@@ -91,13 +98,14 @@ def _sequence_offsets(cu_seqlens, steps):
 
 def _run_ascendc(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
                  initial_state, final_state, cu_seqlens):
+    """Execute validated inputs via fixed, aligned-packed, or general-packed paths."""
     from . import ascendc
 
-    # AscendC consumes FP32 gate parameters and initial state internally. Public
-    # dtypes have already been validated against CUDA's contract.
+    # Pre-Gram converts BF16 gates in UB; parameters and initial state remain
+    # FP32 internally. Public dtypes have been validated against CUDA's contract.
     if cu_seqlens is None:
         ascendc.kda_bt16_fwd_ascendc(
-            q, k, v, g.float(), beta.float(), scale=float(scale),
+            q, k, v, g, beta.float(), scale=float(scale),
             initial_state=None if initial_state is None else initial_state.float(),
             output_final_state=final_state is not None,
             A_log=A_log, bias=dt_bias, lower_bound=float(lower_bound),
@@ -121,14 +129,14 @@ def _run_ascendc(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
         # Keep its metadata-free kernel indexing and head-major beta fast path.
         shape = (len(offsets) - 1, uniform, *q.shape[2:])
         ascendc.kda_bt16_fwd_ascendc(
-            q.view(shape), k.view(shape), v.view(shape), g.view(shape).float(),
+            q.view(shape), k.view(shape), v.view(shape), g.view(shape),
             beta.view(shape[:3]).float(), scale=float(scale), out=out.view(shape),
             initial_state=None if initial_state is None else initial_state.float(),
             output_final_state=final_state is not None, final_state=final_state,
             A_log=A_log, bias=dt_bias, lower_bound=float(lower_bound))
         return
     ascendc.kda_bt16_fwd_ascendc(
-        q, k, v, g.float(), beta.float(), scale=float(scale),
+        q, k, v, g, beta.float(), scale=float(scale),
         initial_state=None if initial_state is None else initial_state.float(),
         output_final_state=final_state is not None,
         A_log=A_log, bias=dt_bias, lower_bound=float(lower_bound),
@@ -158,5 +166,10 @@ def fwd(
     """
     _check_public_inputs(q, k, v, g, beta, out, A_log, dt_bias,
                          initial_state, final_state, cu_seqlens)
+    if os.environ.get("KDA_AUTO_GRAPH", "0") == "1":
+        from .auto_graph import try_auto_graph
+        if try_auto_graph((q, k, v, g, beta, float(scale), out, A_log, dt_bias,
+                           float(lower_bound), initial_state, final_state, cu_seqlens)):
+            return
     _run_ascendc(q, k, v, g, beta, float(scale), out, A_log, dt_bias,
                  float(lower_bound), initial_state, final_state, cu_seqlens)

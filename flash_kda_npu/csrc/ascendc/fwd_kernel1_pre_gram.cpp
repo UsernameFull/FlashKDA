@@ -87,7 +87,7 @@ static __aicore__ inline void RowReduce(LocalTensor<float> rs, LocalTensor<float
 // protection between the current band's MTE3 stores and the next band's MTE2
 // loads without a broad pipeline drain.
 static __aicore__ inline void post_gram(TQue<TPosition::VECIN, 2>& qin,
-                                        TQue<TPosition::VECIN, 2>& qmk,
+                                        TQue<TPosition::VECIN, 1>& qmk,
                                         TQue<TPosition::VECOUT, 2>& qout,
                                         TQue<TPosition::VECOUT, 2>& qo16,
                                         const LocalTensor<uint8_t> mbitsAll,
@@ -438,7 +438,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     GM_ADDR pAqk32, GM_ADDR pAqk16, GM_ADDR pL, GM_ADDR pMaskS, GM_ADDR pMaskL,
     GM_ADDR pLengths, GM_ADDR pSequences,
     int32_t B, int32_t T, int32_t H, float lower_bound, float scale, int32_t unroll,
-    int32_t xRowBytes, int32_t gRowBytes) {
+    int32_t xRowBytes, int32_t gRowBytes, int32_t gateBf16) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     // Packed metadata rows: [token start, length, first chunk, chunk count].
     // The sentinel row holds the total per-head chunk count. All heads of a
@@ -481,11 +481,12 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // `post_gram` uses a two-deep ring per stream (Gram tiles, masks, fp32
     // result, bf16 rounding).  TPipe does not overlay TQue storage with
     // scratch buffers, so this ring needs explicit UB.
-    TQue<TPosition::VECIN, 2> qgin, qgmk;
+    TQue<TPosition::VECIN, 2> qgin;
+    TQue<TPosition::VECIN, 1> qgmk;
     TQue<TPosition::VECOUT, 2> qgout, qgo16;
     TBuf<TPosition::VECCALC> bQf, bKf, bT0, bT2, bEf, bRed,
         bQnb, bKnb, bRkb, bRvb, bQgb, bKgb, bBias, bBeta, bBb, bAlog, bZz,
-        bGef, bQK, bRvo, bMfull, bBetaIndex;
+        bGef, bGateBf16, bRvo, bMfull, bBetaIndex;
     pipe.InitBuffer(bQf, NG * 4); pipe.InitBuffer(bKf, NG * 4);
     pipe.InitBuffer(bT0, N * 4); pipe.InitBuffer(bT2, NG * 4);
     pipe.InitBuffer(bEf, NG * 4); pipe.InitBuffer(bRed, 384 * 4);
@@ -499,14 +500,16 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     pipe.InitBuffer(bZz, NG * 4);
     // One tile for the first exponential of "zz" (the second one is built
     // over it once the first has no readers left, see the Gram stage), and
-    // the two bf16 tiles that must not be the MTE2 landing buffers (below).
+    // the BF16 gate landing tile. Normalization rounds back through the
+    // consumed Q/K landing tiles; their next MTE2 write is behind em2.
     pipe.InitBuffer(bGef, NG * 4);
-    pipe.InitBuffer(bQK, 2 * NG * 2);
+    pipe.InitBuffer(bGateBf16, N * 2);
     pipe.InitBuffer(bRvo, NG * 2);
     // 2 x 16 x M fp32 per queue slot = 8 KB at CHUNK = 64 for the Gram and
     // mask tiles; the fp32 result and its bf16 rounding are a third pair.
     pipe.InitBuffer(qgin, 2, 2 * 16 * M * 4);
-    pipe.InitBuffer(qgmk, 2, 2 * 16 * M * 4);
+    // Mask bands are allocated and freed serially: only one is live.
+    pipe.InitBuffer(qgmk, 1, 2 * 16 * M * 4);
     pipe.InitBuffer(qgout, 2, 2 * 16 * M * 4);
     pipe.InitBuffer(qgo16, 2, 16 * M * 2);
     // The select's bit masks are V-only.  They are invariant across chunks and
@@ -526,7 +529,8 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     LocalTensor<float> bb = bBb.Get<float>(), alog = bAlog.Get<float>();
     LocalTensor<float> zz = bZz.Get<float>();
     LocalTensor<float> gef = bGef.Get<float>();
-    LocalTensor<bfloat16_t> qnb2 = bQK.Get<bfloat16_t>(), knb2 = bQK.Get<bfloat16_t>()[NG];
+    LocalTensor<bfloat16_t> qnb2 = bQnb.Get<bfloat16_t>(), knb2 = bKnb.Get<bfloat16_t>();
+    LocalTensor<bfloat16_t> gnb = bGateBf16.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> rvbo = bRvo.Get<bfloat16_t>();
     LocalTensor<uint8_t> mbitsAll = bMfull.Get<uint8_t>();
     bool masksBuilt = false;
@@ -541,6 +545,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     LocalTensor<bfloat16_t> qgb = bQgb.Get<bfloat16_t>(), kgb = bKgb.Get<bfloat16_t>();
 
     GlobalTensor<bfloat16_t> Q, K, V, Rk, Rv, Qg, Kg, Ga, Gk, Gb, Gx;
+    GlobalTensor<bfloat16_t> GBf16;
     GlobalTensor<float> G, Beta, Alog, Bias, Decay;
     Q.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pQ));
     K.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pK));
@@ -553,6 +558,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Gk.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pGk));
     Gb.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pGb));
     Gx.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pGx));
+    GBf16.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pG));
     G.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pG));
     Beta.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pBeta));
     Alog.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pAlog));
@@ -636,7 +642,11 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // tile; everything else below is row-local and is walked in NP passes of
     // MT rows, which is what keeps the staging at its KDA_CHUNK = 16 size.
     if (validRows > 0) {
-        DataCopyPad(gf, G[xb], DataCopyExtParams(validRows, D * 4, gRowBytes, 0, 0), padNopF);
+        if (gateBf16) {
+            DataCopyPad(gnb, GBf16[xb], DataCopyExtParams(validRows, D * 2, gRowBytes, 0, 0), padNop);
+        } else {
+            DataCopyPad(gf, G[xb], DataCopyExtParams(validRows, D * 4, gRowBytes, 0, 0), padNopF);
+        }
     }
     SetFlag<HardEvent::MTE2_V>(e2vg);
     if (headChanged) {
@@ -657,6 +667,10 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // UB, and the wait is the only consumer of this channel.
     SetFlag<HardEvent::MTE2_V>(e2vs);
     WaitFlag<HardEvent::MTE2_V>(e2vg);
+    if (gateBf16) {
+        Cast(gf, gnb, RoundMode::CAST_NONE, N);
+        PipeBarrier<PIPE_V>();
+    }
     if (validRows < M) {
         Duplicate(gf[validRows * D], 0.0f, (M - validRows) * D);
         PipeBarrier<PIPE_V>();

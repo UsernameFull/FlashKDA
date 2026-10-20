@@ -1,10 +1,60 @@
-# FlashKDA Ascend NPU backend
+# FlashKDA CATLASS NPU backend
 
-This directory adds the Ascend NPU implementation for FlashKDA.  The native
-path uses the AscendC v1 backend ported from the `kda-ascendc` release: the
-host launcher exposes RTC compilation/launch APIs and
-`flash_kda_npu/ops/ascendc.py` orchestrates the three production
-stages (`pre_gram`, `solve`, and persistent-loop `k2`).
+The default backend is CATLASS (`KDA_BACKEND=catlass`). Device kernels in
+`csrc/catlass/` follow the AscendC backend's execution schedule: 16-row
+preprocessing passes, vectorized multi-chunk triangular substitution,
+resident L1/L0 operands, batched assembly stores and phased multi-head
+persistent recurrence. All matrix products use upstream
+`Catlass::Gemm::Tile::TileMmad`; single-matrix operand loads and GM product
+stores use upstream layout-aware copy tiles. Compatible contiguous vector
+add/multiply/scale and FP32-to-BF16 casts use upstream epilogue tiles.
+Cross-engine handoffs use CATLASS flag objects.
+
+`scheduled_tiles.hpp` adapts upstream components to KDA's existing layouts.
+GM/UB copies, no-padding byte-stride loads, stored-fractal and batched ND/NZ
+GM/L1 copies, ordinary/transposed L1/L0 copies, block/row/column broadcasts,
+and compatible add/multiply/scale/narrowing operations now use upstream tiles.
+KDA retains scalar zero-padding loads, a UB fractal rearrangement, strided
+prefix/reduction adds, fused multiply-add substitution, batched Fixpipe and
+the L0C-to-L1 intermediate. Nonlinear/reduction primitives, BF16 widening,
+queues and intra-core hard events/barriers also remain AscendC where the
+pinned upstream API has no matching layout, rounding or ownership contract.
+CATLASS itself depends on AscendC; CANN, RTC and the host launcher remain
+required. This implementation does not claim to eliminate all AscendC calls.
+
+The public API and `ops.ascendc` import path are preserved.
+`KDA_BACKEND=ascendc` selects the separate previous implementation in
+`csrc/ascendc/` for controlled comparisons. The CATLASS path does not include
+those sources. Select the backend before importing and use a fresh process
+when switching. There is no automatic fallback. `get_last_profile()["backend"]`
+and benchmark JSON identify the implementation.
+
+Pinned CATLASS headers, license and revision information are shipped under
+`csrc/third_party/catlass/`, including in wheels. No separate CATLASS download
+is required.
+
+To reproduce identical-input performance and numerical comparisons:
+
+```bash
+bash flash_kda_npu/csrc/build.sh
+ASCEND_RT_VISIBLE_DEVICES=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+python -m flash_kda_npu.benchmarks.bench_catlass \
+  --graphs --json /tmp/catlass-comparison.json --warmup 30 --iters 100 --repeats 3
+```
+
+The harness runs backends in separate processes, times the public API with NPU
+events after RTC warmup, checks finite values, and reports bitwise equality,
+maximum absolute difference and relative RMS over every output/state element.
+Cases include fixed lengths, partial chunks, unequal packed lengths and empty
+sequences, with BF16/FP32/no state. `--graphs` measures fixed-length graph replay
+and checks equality with eager execution. Independent FP64-reference tests
+remain the accuracy oracle; cross-backend bitwise equality is not required
+and is measured explicitly by the comparison harness.
+
+Current upstream-component coverage and validation are recorded in
+[the extended tile report](benchmarks/results/catlass_extra_tiles_910b3.md).
+The component, independent-rewrite and initial tile reports in the same
+folder describe historical implementations, not the current kernels.
 
 The native pipeline has three logical stages:
 
@@ -30,12 +80,11 @@ flash_kda_npu/
 |-- csrc/
 |   |-- flash_kda.cpp
 |   |-- build.sh
-|   `-- ascendc/
-|       |-- fwd_kernel1_pre_gram.cpp
-|       |-- fwd_kernel1_solve_wide.cpp
-|       |-- fwd_kernel1_solve_assemble.cpp
-|       |-- fwd_kernel1_solve_cube.cpp
-|       `-- fwd_kernel2_persistent.cpp
+|   |-- catlass/                 # CATLASS tiles, AscendC-matched schedule
+|   |   |-- scheduled_tiles.hpp
+|   |   `-- fwd_kernel*.cpp
+|   |-- ascendc/                 # separate previous implementation
+|   `-- third_party/catlass/     # pinned upstream headers and license
 |-- tests/
 |   |-- conftest.py
 |   |-- cuda_cases.py
@@ -50,8 +99,13 @@ flash_kda_npu/
 |   `-- generate_benchmark_md.py
 `-- ops/
     |-- ascendc.py
+    |-- auto_graph.py
+    |-- graphs.py
     `-- kda_fwd.py
 ```
+
+See [code structure and maintenance notes](ARCHITECTURE.md) for the call paths,
+schedule units, graph ownership, and relevant validation commands.
 
 ## Build
 
@@ -95,7 +149,7 @@ flash_kda.fwd(
 ```
 
 `flash_kda.fwd` sends non-CUDA tensors to `flash_kda_npu.ops.fwd`. The NPU
-entry point executes native AscendC only, with no automatic PyTorch fallback.
+entry point executes the selected native backend only, with no automatic PyTorch fallback.
 CPU inputs are rejected. Validation, import, RTC compilation and kernel launch
 errors propagate to the caller, as on the CUDA path.
 
@@ -159,6 +213,71 @@ initial states, or copy temporary outputs back. Metadata handling, public dtype
 conversions, buffer allocation and all native launches remain inside benchmark
 timing. There is no PyTorch KDA fallback.
 
+## Automatic graph cache
+
+Set `KDA_AUTO_GRAPH=1` to keep regular `flash_kda.fwd(...)` calls unchanged
+while reusing graphs for repeated fixed-length tensor addresses. By default,
+the first three calls execute normally, the fourth captures and replays, and
+subsequent matching calls replay directly. Capture has a one-time synchronization
+and setup cost; it primarily benefits short sequences.
+
+The key includes every tensor's address, shape, strides, dtype and device,
+scalar parameters, current stream and runtime scheduling overrides. Updating
+values in place uses the cached graph. New addresses/shapes/parameters miss the
+cache and execute normally before becoming eligible for capture. Packed inputs,
+`KDA_PROFILE=1`, external graph capture and input/output storage aliasing bypass
+the automatic cache. Input updates must be ordered on the call's stream.
+
+Caches are local to each thread and separated by stream. Each thread retains
+at most `KDA_AUTO_GRAPH_CACHE_SIZE=8` entries, including their caller tensors and
+graph workspaces. LRU eviction synchronizes the retired stream before releasing
+storage. `KDA_AUTO_GRAPH_WARMUP=3` changes the eager-call threshold; both settings
+must be positive. Replacing tensors every call will miss repeatedly and may
+incur eviction overhead; this mode is intended for stable tensor buffers.
+
+```bash
+KDA_AUTO_GRAPH=1 python your_application.py
+```
+
+`from flash_kda_npu.ops import clear_auto_graph_cache` provides an explicit
+per-thread cache cleanup function (it synchronizes pending cached work).
+Disabling the environment flag uses ordinary forward but retains existing
+cached entries until cleanup or eviction. Explicit `capture_fwd` remains
+available and does not recursively enter the automatic cache.
+
+## Explicit fixed-shape graph replay
+
+For repeated fixed-length calls, capture once and update the input tensors in
+place before replay. Shapes, tensor addresses and scalar parameters stay fixed;
+the graph retains its private intermediate storage and caller tensors.
+
+```python
+from flash_kda_npu.ops import capture_fwd
+
+captured = capture_fwd(
+    q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
+    initial_state=initial_state, final_state=final_state,
+)
+# Update input values in place on the replay stream, then enqueue forward:
+captured.replay()
+```
+
+Capture requires `KDA_PROFILE=0`, warms up, executes forward, and synchronizes
+the device. Initial and
+final state must use separate storage. Use separate capture objects and output
+buffers for concurrent executions; order input updates with the replay stream.
+Changing shapes/addresses and packed metadata use the regular forward API.
+The regular API does not capture automatically. Graph replay chiefly benefits
+short sequences where host launch/allocation overhead dominates.
+
+```bash
+python -m flash_kda_npu.benchmarks.bench_graph --T 256 --H 96 --state fp32 \
+  --warmup 30 --iters 200 --repeats 5 --json /tmp/kda-graph.json
+```
+
+The graph benchmark includes finite-value and bitwise output/state checks.
+Capture setup is reported separately from regular and replay event timings.
+
 ## Configuration and profiling
 
 The default native chunk size is 64. Partial chunks use full computation tiles
@@ -166,11 +285,53 @@ of the configured size (16, 32 or 64), with neutral state transitions in
 invalid rows. Fixed-length input tails are filled on chip, without packing
 the full Q/K/V/g inputs or copying a temporary output back.
 
+Pre-Gram reads public BF16 gates directly and casts them to FP32 in UB before
+activation and the prefix scan. This avoids a full-sized FP32 gate allocation
+and conversion launch; all gate arithmetic retains FP32 precision. The native
+entry also accepts FP32 gates. Q/K normalization rounds to BF16 before gate
+scaling. The rewritten preprocessing block uses roughly 37 KiB of UB, while
+the four-head recurrence block uses roughly 177 KiB of the 192 KiB UB budget.
+
 Pre-Gram automatically balances chunk work and block startup across whole
 Cube waves, avoiding very small unroll values for marginal compute savings.
 Grids below 256 chunks retain one chunk per subcore. `KDA_PRE_UNROLL` overrides
 the automatic choice; the selected value is reported as `pre_unroll` in the
 last-call profile and benchmark JSON.
+
+For fixed/equal-length inputs, persistent scheduling compares stride grids and
+nearby whole-Cube-wave grids using the actual heads in each block. It estimates
+block retirement rather than charging every block for the largest head count;
+for example, 96 heads on 20 Cube cores select 40 blocks instead of 32. The host cost model retains the legacy overlap estimates; the new per-head
+recurrence cycle is serialized, so these estimates may need future retuning. Tied estimates keep the previous
+choice, and shape decisions are cached (128 entries).
+
+For unequal packed sequences, persistent scheduling first estimates the existing
+head stride map, including single-head tails that lose engine overlap. It also
+compares grouping heads by similar recurrence length, with longer groups first.
+The model includes block startup and requires a gain of at least 16 chunk steps
+and 5% before selecting a new map. Equal chunk counts retain the existing picker.
+The explicit head map is appended to the existing sequence metadata and uploaded
+with it; no separate map allocation, copy or kernel launch is added. Each head's
+FP32 recurrence and final-state destination stay the same.
+
+Both decisions are cached by shape, core count and head cap (128 entries each).
+`KDA_PERSIST_HEAD_MAP=auto` is the default; `stride` retains the previous mapping
+and `grouped` forces the candidate for controlled experiments.
+`KDA_PERSIST_LOOP_BLOCKS` still overrides the grid size. The last-call profile
+and benchmark JSON report `persistent_blocks` and `persistent_head_map`.
+The model is a heuristic: warm-cache gains do not include an uncached host
+planning cost on every call, and performance needs separate validation on
+hardware with a different core count.
+
+To sweep both scheduling knobs and check bitwise output/final-state agreement:
+
+```bash
+python -m flash_kda_npu.benchmarks.bench_schedule --json /tmp/kda-schedule.json
+# Optional: --heads 32 --seq-lens 0 1 64 7000 63 1064
+```
+
+The sweep uses FP32 state, NPU events for end-to-end timing, and separate
+synchronized host measurements for stage medians. Solve overlap stays enabled.
 
 Warm up before benchmarking to exclude first-use RTC compilation and
 mask/identity initialization. For native execution analysis, set `KDA_PROFILE=1`
@@ -217,7 +378,7 @@ python flash_kda_npu/benchmarks/generate_benchmark_md.py --mode fixed
 
 The default mode runs both fixed and variable-length cases, as in the CUDA suite.
 Use `--mode fixed` or `--mode varlen` to select one kind.
-All three FlashKDA state variants (bf16, no state, fp32) execute AscendC.
+All three FlashKDA state variants (bf16, no state, fp32) execute the selected native backend.
 The default run also benchmarks FLA `chunk_kda` and `chunk_gated_delta_rule`
 on NPU with the same operator options as the CUDA benchmark. FLA uses FP32 initial
 and final states. `chunk_kda` enables gate activation, Q/K normalization and
@@ -258,6 +419,42 @@ metadata and dependency versions. JSON distinguishes FlashKDA from the two FLA i
 Markdown reports compare FlashKDA FP32-state mean latency with FLA KDA/GDN
 and their speedups, using the same columns as the CUDA report. Host metadata
 handling and public dtype conversions are included in the timed callable.
+
+## Model-level inference benchmark
+
+`benchmarks/bench_kda_model.py` evaluates the pretrained
+`openeurollm/kda-sigmoid-1.3B-100B` checkpoint (24 unsigned bounded-sigmoid
+KDA layers, H=16, D=128). Download and inspect its custom model code first.
+The harness loads local files with `trust_remote_code=True` and installs an
+in-memory adapter; it does not rewrite the checkpoint. Both backends retain
+the checkpoint's projection, portable convolution, normalization and MLP
+implementations. Decode uses the same FLA recurrent kernel in every variant.
+This measures inference; FlashKDA does not provide a training backward.
+
+```bash
+# Run from the repository root after loading the Ascend toolkit environment.
+ASCEND_RT_VISIBLE_DEVICES=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+FLA_FLASH_KDA=0 KDA_PROFILE=0 KDA_AUTO_GRAPH_CACHE_SIZE=8 \
+KDA_AUTO_GRAPH_WARMUP=3 PYTHONPATH=. \
+python -m flash_kda_npu.benchmarks.bench_kda_model \
+  --model /data/models/kda-sigmoid-1.3B-100B \
+  --output /tmp/kda_model_results.json --stage all --profile
+```
+
+The script checks logits, loss, corresponding-layer outputs/states and short
+free-running generation, then measures fixed/packed prefill and fixed-length
+128-token greedy generation. Prefill computes only the last token's LM head
+(`logits_to_keep=1`). Timings include host dispatch and synchronize each sample;
+compilation, model loading and tokenization are excluded from steady timings.
+Profiler windows run separately. JSON records raw samples and actual backend
+call counts; numerical thresholds are diagnostic, not a model-quality
+certification. Small BF16 logit differences can change greedy output, so read
+the generation comparison alongside the latency results.
+
+The automatic cache variant uses the regular per-call cache. Newly allocated
+intermediate tensors and a cache smaller than the layer count may prevent
+capture entirely; the report includes captured-entry counts. Whole-model graph
+capture is a separate optimization and is not measured here.
 
 ## Precision
 

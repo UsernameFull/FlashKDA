@@ -108,18 +108,28 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
     GM_ADDR pU, GM_ADDR pW, GM_ADDR pQg, GM_ADDR pAqk, GM_ADDR pKgT, GM_ADDR pDecay,
     GM_ADDR pD1, GM_ADDR pD2, GM_ADDR pD3, GM_ADDR pD4,
     GM_ADDR pOut, GM_ADDR pVnewT,
-    GM_ADDR pH0, GM_ADDR pFinal, GM_ADDR pS16, GM_ADDR pSequences,
+    GM_ADDR pH0, GM_ADDR pFinal, GM_ADDR pS16, GM_ADDR pSequences, GM_ADDR pHeadMap,
     int32_t BH, int32_t NT, int32_t NV, int32_t NBLK, float scale, int32_t NH,
     int32_t finalBF16, int32_t T) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     const int32_t nv = NV;
     const auto sequences = reinterpret_cast<__gm__ int64_t *>(pSequences);
+    // Four INT64 slots per row share the sequence table's layout. Unused
+    // slots are -1; both engines must visit exactly the same head order.
+    const auto headMap = reinterpret_cast<__gm__ int64_t *>(pHeadMap);
 
     if ASCEND_IS_AIC {
         const int32_t blk = static_cast<int32_t>(GetBlockIdx());
         int32_t heads[MAXH];
         int32_t nh = 0;
-        for (int32_t h = blk; h < BH && nh < MAXH; h += NBLK) heads[nh++] = h;
+        if (pHeadMap != nullptr) {
+            for (int32_t slot = 0; slot < MAXH; ++slot) {
+                const int32_t h = headMap[blk * 4 + slot];
+                if (h >= 0) heads[nh++] = h;
+            }
+        } else {
+            for (int32_t h = blk; h < BH && nh < MAXH; h += NBLK) heads[nh++] = h;
+        }
         if (nh == 0) return;
         // Cache the small immutable schedule once per block/engine. Reading
         // sequence metadata in every stage of every chunk is scalar GM traffic.
@@ -401,7 +411,14 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         const int32_t iv = static_cast<int32_t>(GetSubBlockIdx());
         int32_t heads[MAXH];
         int32_t nh = 0;
-        for (int32_t h = blk; h < BH && nh < MAXH; h += NBLK) heads[nh++] = h;
+        if (pHeadMap != nullptr) {
+            for (int32_t slot = 0; slot < MAXH; ++slot) {
+                const int32_t h = headMap[blk * 4 + slot];
+                if (h >= 0) heads[nh++] = h;
+            }
+        } else {
+            for (int32_t h = blk; h < BH && nh < MAXH; h += NBLK) heads[nh++] = h;
+        }
         if (nh == 0) return;
         // Cache the small immutable schedule once per block/engine. Reading
         // sequence metadata in every stage of every chunk is scalar GM traffic.

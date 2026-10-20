@@ -1,0 +1,100 @@
+{
+  "full": {
+    "tests": 1027,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 12,
+    "time": 727.868,
+    "passed": 1015,
+    "metric_maxima": {
+      "output_relative_rms": {
+        "value": 0.008736381752470618,
+        "test": "test_fwd_fixed[in_only-bf16-T8192-H1]"
+      },
+      "output_max_window_relative_rms": {
+        "value": 0.008736782718870665,
+        "test": "test_fwd_varlen[in+out-fp32-seqs1300_547_2048_963_271_3063-H1]"
+      },
+      "output_post_transient_max_relative_rms": {
+        "value": 0.004462568091062126,
+        "test": "test_fwd_batched[in+out-bf16-B8_T128-H1]"
+      },
+      "state_relative_rms": {
+        "value": 0.007027730072487762,
+        "test": "test_cuda_gate_bias_accuracy[fixed-g=-8_bias=0]"
+      }
+    }
+  },
+  "long": {
+    "tests": 8,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "time": 340.514,
+    "passed": 8,
+    "metric_maxima": {
+      "output_relative_rms": {
+        "value": 0.008411580606462564,
+        "test": "test_fwd_long[T131072]"
+      },
+      "output_max_window_relative_rms": {
+        "value": 0.008414471621756443,
+        "test": "test_fwd_long[T131072]"
+      },
+      "output_post_transient_max_relative_rms": {
+        "value": 0.004249235033231282,
+        "test": "test_fwd_long_varlen[seqs524288_524288]"
+      },
+      "state_relative_rms": {
+        "value": 0.0028863234302848465,
+        "test": "test_fwd_long[T1048576]"
+      }
+    }
+  },
+  "chunk16": {
+    "tests": 413,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 104,
+    "time": 80.394,
+    "passed": 309,
+    "metric_maxima": {}
+  },
+  "chunk32": {
+    "tests": 413,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 72,
+    "time": 89.081,
+    "passed": 341,
+    "metric_maxima": {}
+  },
+  "unfused": {
+    "tests": 91,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "time": 63.933,
+    "passed": 91,
+    "metric_maxima": {}
+  },
+  "dual": {
+    "tests": 2,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "time": 47.64,
+    "passed": 2,
+    "metric_maxima": {}
+  },
+  "unique_passed_test_ids": 1027,
+  "checks": {
+    "package_data_kernel_vendor_files": 244,
+    "host_build": true,
+    "python_compile": true,
+    "diff_check": true,
+    "vendor_headers_unmodified": 233,
+    "stage_direct_replaced_api_calls": 0
+  },
+  "execution_note": "Initial full run on card2 with 8 workers hit device memory exhaustion and runtime allocation errors and was stopped. Final full run uses 4 workers on card5. The initial card1 timing attempt was discarded; performance was remeasured on card6. No accuracy criteria or algorithm were changed for these reruns."
+}

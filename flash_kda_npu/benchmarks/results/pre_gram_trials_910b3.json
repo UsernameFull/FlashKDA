@@ -1,0 +1,326 @@
+{
+  "device": "Ascend910B3",
+  "cube_cores": 20,
+  "H": 96,
+  "CHUNK": 64,
+  "state": "fp32",
+  "lengths": [
+    1300,
+    547,
+    2048,
+    963,
+    271,
+    3063
+  ],
+  "warmup": 30,
+  "iters": 200,
+  "repeats": 3,
+  "rounds": 3,
+  "OMP_NUM_THREADS": 1,
+  "MKL_NUM_THREADS": 1,
+  "description": "Sequential isolated measurements; alternate candidate order each round. Each mode has 1800 measured calls. Stage medians use 10 separate synchronized host calls, while end-to-end uses NPU events with solve overlap retained.",
+  "trial_32_argument_abi": [
+    {
+      "lengths": [
+        1300,
+        547,
+        2048,
+        963,
+        271,
+        3063
+      ],
+      "H": 96,
+      "mode": "baseline",
+      "round": 0,
+      "bitwise_equal": true,
+      "mean_ms": 9.993344125747681,
+      "min_ms": 9.933239936828613,
+      "max_ms": 11.680580139160156,
+      "pre_gram_ms": 4.185770638287067,
+      "solve_ms": 3.163490444421768,
+      "k2_ms": 3.1331852078437805
+    },
+    {
+      "lengths": [
+        1300,
+        547,
+        2048,
+        963,
+        271,
+        3063
+      ],
+      "H": 96,
+      "mode": "cache",
+      "round": 0,
+      "bitwise_equal": true,
+      "mean_ms": 9.972196858723958,
+      "min_ms": 9.912859916687012,
+      "max_ms": 10.889180183410645,
+      "pre_gram_ms": 4.165169782936573,
+      "solve_ms": 3.124559298157692,
+      "k2_ms": 3.125878982245922
+    },
+    {
+      "lengths": [
+        1300,
+        547,
+        2048,
+        963,
+        271,
+        3063
+      ],
+      "H": 96,
+      "mode": "cache_pack",
+      "round": 0,
+      "bitwise_equal": true,
+      "mean_ms": 10.500164874394734,
+      "min_ms": 10.399979591369629,
+      "max_ms": 10.946800231933594,
+      "pre_gram_ms": 4.132125526666641,
+      "solve_ms": 3.262280486524105,
+      "k2_ms": 3.142744302749634
+    },
+    {
+      "lengths": [
+        1300,
+        547,
+        2048,
+        963,
+        271,
+        3063
+      ],
+      "H": 96,
+      "mode": "cache_pack",
+      "round": 1,
+      "bitwise_equal": true,
+      "mean_ms": 10.488532462120055,
+      "min_ms": 10.42908000946045,
+      "max_ms": 11.58594036102295,
+      "pre_gram_ms": 4.130165092647076,
+      "solve_ms": 3.253309056162834,
+      "k2_ms": 3.1343353912234306
+    },
+    {
+      "lengths": [
+        1300,
+        547,
+        2048,
+        963,
+        271,
+        3063
+      ],
+      "H": 96,
+      "mode": "cache",
+      "round": 1,
+      "bitwise_equal": true,
+      "mean_ms": 9.99647837003072,
+      "min_ms": 9.947799682617188,
+      "max_ms": 10.427200317382812,
+      "pre_gram_ms": 4.17262502014637,
+      "solve_ms": 3.190169110894203,
+      "k2_ms": 3.1393850222229958
+    },
+    {
+      "lengths": [
+        1300,
+        547,
+        2048,
+        963,
+        271,
+        3063
+      ],
+      "H": 96,
+      "mode": "baseline",
+      "round": 1,
+      "bitwise_equal": true,
+      "mean_ms": 10.006051085789998,
+      "min_ms": 9.959280014038086,
+      "max_ms": 10.540579795837402,
+      "pre_gram_ms": 4.185624420642853,
+      "solve_ms": 3.1747305765748024,
+      "k2_ms": 3.130280412733555
+    },
+    {
+      "lengths": [
+        1300,
+        547,
+        2048,
+        963,
+        271,
+        3063
+      ],
+      "H": 96,
+      "mode": "baseline",
+      "round": 2,
+      "bitwise_equal": true,
+      "mean_ms": 9.998596054712932,
+      "min_ms": 9.949239730834961,
+      "max_ms": 10.933500289916992,
+      "pre_gram_ms": 4.186824895441532,
+      "solve_ms": 3.162114880979061,
+      "k2_ms": 3.133985213935375
+    },
+    {
+      "lengths": [
+        1300,
+        547,
+        2048,
+        963,
+        271,
+        3063
+      ],
+      "H": 96,
+      "mode": "cache",
+      "round": 2,
+      "bitwise_equal": true,
+      "mean_ms": 9.987574798266094,
+      "min_ms": 9.937459945678711,
+      "max_ms": 10.202919960021973,
+      "pre_gram_ms": 4.175805486738682,
+      "solve_ms": 3.3045951277017593,
+      "k2_ms": 3.139045089483261
+    },
+    {
+      "lengths": [
+        1300,
+        547,
+        2048,
+        963,
+        271,
+        3063
+      ],
+      "H": 96,
+      "mode": "cache_pack",
+      "round": 2,
+      "bitwise_equal": true,
+      "mean_ms": 10.481800039609274,
+      "min_ms": 10.42609977722168,
+      "max_ms": 10.642000198364258,
+      "pre_gram_ms": 4.133235663175583,
+      "solve_ms": 3.2269349321722984,
+      "k2_ms": 3.1296899542212486
+    }
+  ],
+  "confirmation_production_31_argument_abi": [
+    {
+      "lengths": [
+        1300,
+        547,
+        2048,
+        963,
+        271,
+        3063
+      ],
+      "H": 96,
+      "mode": "baseline",
+      "round": 0,
+      "bitwise_equal": true,
+      "mean_ms": 9.997277490297954,
+      "min_ms": 9.948180198669434,
+      "max_ms": 10.165120124816895,
+      "pre_gram_ms": 4.200664348900318,
+      "solve_ms": 3.5182051360607147,
+      "k2_ms": 3.138049505650997
+    },
+    {
+      "lengths": [
+        1300,
+        547,
+        2048,
+        963,
+        271,
+        3063
+      ],
+      "H": 96,
+      "mode": "cache",
+      "round": 0,
+      "bitwise_equal": true,
+      "mean_ms": 10.025132168134054,
+      "min_ms": 9.97070026397705,
+      "max_ms": 10.328619956970215,
+      "pre_gram_ms": 4.187900573015213,
+      "solve_ms": 3.478758968412876,
+      "k2_ms": 3.1365901231765747
+    },
+    {
+      "lengths": [
+        1300,
+        547,
+        2048,
+        963,
+        271,
+        3063
+      ],
+      "H": 96,
+      "mode": "cache",
+      "round": 1,
+      "bitwise_equal": true,
+      "mean_ms": 10.022405144373575,
+      "min_ms": 9.970060348510742,
+      "max_ms": 10.183099746704102,
+      "pre_gram_ms": 4.185505211353302,
+      "solve_ms": 3.529115580022335,
+      "k2_ms": 3.1367102637887
+    },
+    {
+      "lengths": [
+        1300,
+        547,
+        2048,
+        963,
+        271,
+        3063
+      ],
+      "H": 96,
+      "mode": "baseline",
+      "round": 1,
+      "bitwise_equal": true,
+      "mean_ms": 10.02995346069336,
+      "min_ms": 9.976840019226074,
+      "max_ms": 11.202799797058105,
+      "pre_gram_ms": 4.193255677819252,
+      "solve_ms": 3.4977253526449203,
+      "k2_ms": 3.1416546553373337
+    },
+    {
+      "lengths": [
+        1300,
+        547,
+        2048,
+        963,
+        271,
+        3063
+      ],
+      "H": 96,
+      "mode": "baseline",
+      "round": 2,
+      "bitwise_equal": true,
+      "mean_ms": 10.030049920082092,
+      "min_ms": 9.979780197143555,
+      "max_ms": 12.041979789733887,
+      "pre_gram_ms": 4.193765111267567,
+      "solve_ms": 3.441569395363331,
+      "k2_ms": 3.128909505903721
+    },
+    {
+      "lengths": [
+        1300,
+        547,
+        2048,
+        963,
+        271,
+        3063
+      ],
+      "H": 96,
+      "mode": "cache",
+      "round": 2,
+      "bitwise_equal": true,
+      "mean_ms": 10.017931583722433,
+      "min_ms": 9.960760116577148,
+      "max_ms": 10.496999740600586,
+      "pre_gram_ms": 4.182325676083565,
+      "solve_ms": 3.4325607120990753,
+      "k2_ms": 3.141525201499462
+    }
+  ]
+}

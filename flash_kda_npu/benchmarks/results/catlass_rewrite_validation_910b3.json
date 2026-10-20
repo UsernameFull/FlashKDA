@@ -1,0 +1,109 @@
+{
+  "full": {
+    "tests": 1027,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 12,
+    "time": 463.984,
+    "passed": 1015,
+    "metric_maxima": {
+      "output_relative_rms": {
+        "value": 0.008736381752470618,
+        "test": "test_fwd_fixed[in_only-bf16-T8192-H1]"
+      },
+      "output_max_window_relative_rms": {
+        "value": 0.008736782718870665,
+        "test": "test_fwd_varlen[in+out-fp32-seqs1300_547_2048_963_271_3063-H1]"
+      },
+      "state_relative_rms": {
+        "value": 0.007027730072487762,
+        "test": "test_cuda_gate_bias_accuracy[fixed-g=-8_bias=0]"
+      },
+      "output_post_transient_max_relative_rms": {
+        "value": 0.004462568091062126,
+        "test": "test_fwd_batched[in_only-fp32-B8_T128-H1]"
+      }
+    }
+  },
+  "long": {
+    "tests": 4,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "time": 171.993,
+    "passed": 4,
+    "metric_maxima": {
+      "output_relative_rms": {
+        "value": 0.008411580606462564,
+        "test": "test_fwd_long_varlen[seqs131072]"
+      },
+      "output_max_window_relative_rms": {
+        "value": 0.008414471621756443,
+        "test": "test_fwd_long_varlen[seqs131072]"
+      },
+      "output_post_transient_max_relative_rms": {
+        "value": 0.004249235033231282,
+        "test": "test_fwd_long[T1048576]"
+      },
+      "state_relative_rms": {
+        "value": 0.0028863234302848465,
+        "test": "test_fwd_long[T1048576]"
+      }
+    }
+  },
+  "native_long": {
+    "tests": 2,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "time": 71.014,
+    "passed": 2,
+    "metric_maxima": {}
+  },
+  "native_scale_long": {
+    "tests": 2,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "time": 319.988,
+    "passed": 2,
+    "metric_maxima": {}
+  },
+  "chunk16": {
+    "tests": 413,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 104,
+    "time": 81.52,
+    "passed": 309,
+    "metric_maxima": {}
+  },
+  "chunk32": {
+    "tests": 413,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 72,
+    "time": 94.738,
+    "passed": 341,
+    "metric_maxima": {}
+  },
+  "unfused": {
+    "tests": 91,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "time": 63.555,
+    "passed": 91,
+    "metric_maxima": {}
+  },
+  "dual_device": {
+    "tests": 2,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "time": 48.779,
+    "passed": 2,
+    "metric_maxima": {}
+  },
+  "unique_passed_test_ids": 1027
+}

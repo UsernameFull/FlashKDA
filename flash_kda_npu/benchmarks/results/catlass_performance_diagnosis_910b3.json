@@ -1,0 +1,752 @@
+{
+  "date": "2026-10-19",
+  "device": "Ascend910B3",
+  "note": "H96 backends measured sequentially on physical card 6; stage profiles are synchronized host medians, end-to-end uses NPU events. Profiling perturbs overlap, so stage medians need not sum to end-to-end. Schedule sweeps compare output and FP32 final state bitwise against each backend default.",
+  "catlass_h96": {
+    "cube_cores": 20,
+    "device": "Ascend910B3",
+    "results": [
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 0,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 40
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 82.66514282226562,
+        "min_ms": 82.27216339111328,
+        "max_ms": 83.44062042236328,
+        "pre_gram_ms": 66.15651957690716,
+        "solve_ms": 9.991619735956192,
+        "k2_ms": 7.100289687514305
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 2,
+        "blocks_override": 0,
+        "pre_unroll": 2,
+        "blocks": {
+          "kda_pre_gram_mix": 3072,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 40
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 80.56433639526367,
+        "min_ms": 80.25013732910156,
+        "max_ms": 81.4351806640625,
+        "pre_gram_ms": 64.05550986528397,
+        "solve_ms": 9.973360225558281,
+        "k2_ms": 7.126549258828163
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 66,
+        "blocks_override": 0,
+        "pre_unroll": 66,
+        "blocks": {
+          "kda_pre_gram_mix": 94,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 40
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 87.24619369506836,
+        "min_ms": 86.61382293701172,
+        "max_ms": 88.04759979248047,
+        "pre_gram_ms": 70.69206982851028,
+        "solve_ms": 9.977210313081741,
+        "k2_ms": 7.171990349888802
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 24,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 24
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 86.3921745300293,
+        "min_ms": 85.71896362304688,
+        "max_ms": 87.29644012451172,
+        "pre_gram_ms": 66.09608046710491,
+        "solve_ms": 9.981600567698479,
+        "k2_ms": 10.997349396348
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 32,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 32
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 84.14481887817382,
+        "min_ms": 83.2876968383789,
+        "max_ms": 84.9338607788086,
+        "pre_gram_ms": 66.2219487130642,
+        "solve_ms": 9.977400302886963,
+        "k2_ms": 8.137598633766174
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 40,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 40
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 82.90026321411133,
+        "min_ms": 82.18939971923828,
+        "max_ms": 84.09380340576172,
+        "pre_gram_ms": 66.14627875387669,
+        "solve_ms": 9.98665951192379,
+        "k2_ms": 6.90087117254734
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 48,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 48
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 83.86006622314453,
+        "min_ms": 83.28299713134766,
+        "max_ms": 84.45948028564453,
+        "pre_gram_ms": 66.18762016296387,
+        "solve_ms": 9.974509477615356,
+        "k2_ms": 8.35777074098587
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 60,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 60
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 82.6319076538086,
+        "min_ms": 82.25138092041016,
+        "max_ms": 83.23069763183594,
+        "pre_gram_ms": 66.27707928419113,
+        "solve_ms": 9.974181652069092,
+        "k2_ms": 7.078789174556732
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 80,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 80
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 82.71464767456055,
+        "min_ms": 82.03121948242188,
+        "max_ms": 83.55021667480469,
+        "pre_gram_ms": 66.21704995632172,
+        "solve_ms": 10.040400549769402,
+        "k2_ms": 7.071740925312042
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 96,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 96
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 82.71890182495117,
+        "min_ms": 81.9527587890625,
+        "max_ms": 83.48278045654297,
+        "pre_gram_ms": 66.28192961215973,
+        "solve_ms": 9.97358001768589,
+        "k2_ms": 7.066540420055389
+      }
+    ]
+  },
+  "ascendc_h96": {
+    "cube_cores": 20,
+    "device": "Ascend910B3",
+    "results": [
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 0,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 40
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 8.386271858215332,
+        "min_ms": 8.230199813842773,
+        "max_ms": 8.979419708251953,
+        "pre_gram_ms": 4.001239314675331,
+        "solve_ms": 3.5294312983751297,
+        "k2_ms": 2.659561112523079
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 2,
+        "blocks_override": 0,
+        "pre_unroll": 2,
+        "blocks": {
+          "kda_pre_gram_mix": 3072,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 40
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 9.667518043518067,
+        "min_ms": 9.525779724121094,
+        "max_ms": 10.182220458984375,
+        "pre_gram_ms": 5.2911508828401566,
+        "solve_ms": 3.3793505281209946,
+        "k2_ms": 2.6497412472963333
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 66,
+        "blocks_override": 0,
+        "pre_unroll": 66,
+        "blocks": {
+          "kda_pre_gram_mix": 94,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 40
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 8.587569999694825,
+        "min_ms": 8.448280334472656,
+        "max_ms": 9.072580337524414,
+        "pre_gram_ms": 4.208909347653389,
+        "solve_ms": 3.5778097808361053,
+        "k2_ms": 2.673119306564331
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 24,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 24
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 9.514863967895508,
+        "min_ms": 9.344539642333984,
+        "max_ms": 10.074359893798828,
+        "pre_gram_ms": 3.9965305477380753,
+        "solve_ms": 3.5221707075834274,
+        "k2_ms": 3.854651004076004
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 32,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 32
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 8.685748100280762,
+        "min_ms": 8.51636028289795,
+        "max_ms": 9.248200416564941,
+        "pre_gram_ms": 4.001490771770477,
+        "solve_ms": 3.463849425315857,
+        "k2_ms": 2.9687900096178055
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 40,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 40
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 8.369628047943115,
+        "min_ms": 8.206819534301758,
+        "max_ms": 8.884539604187012,
+        "pre_gram_ms": 3.996068611741066,
+        "solve_ms": 3.4377407282590866,
+        "k2_ms": 2.6708804070949554
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 48,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 48
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 9.009901905059815,
+        "min_ms": 8.857319831848145,
+        "max_ms": 9.547220230102539,
+        "pre_gram_ms": 3.9984900504350662,
+        "solve_ms": 3.454310819506645,
+        "k2_ms": 3.307599574327469
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 60,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 60
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 8.978197956085205,
+        "min_ms": 8.833259582519531,
+        "max_ms": 9.514639854431152,
+        "pre_gram_ms": 3.9975903928279877,
+        "solve_ms": 3.4953802824020386,
+        "k2_ms": 3.275711089372635
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 80,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 80
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 9.927099895477294,
+        "min_ms": 9.7427396774292,
+        "max_ms": 10.483839988708496,
+        "pre_gram_ms": 3.9974600076675415,
+        "solve_ms": 3.4509096294641495,
+        "k2_ms": 4.231799393892288
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 96,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 96,
+        "pre_unroll": 77,
+        "blocks": {
+          "kda_pre_gram_mix": 80,
+          "kda_solve_wu_wide": 2048,
+          "kda_solve_fused": 6144,
+          "kda_k2_persistent_loop": 96
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 10.766941928863526,
+        "min_ms": 10.627099990844727,
+        "max_ms": 11.278160095214844,
+        "pre_gram_ms": 3.992069512605667,
+        "solve_ms": 3.283599391579628,
+        "k2_ms": 5.076659843325615
+      }
+    ]
+  },
+  "catlass_h16_card4": {
+    "cube_cores": 20,
+    "device": "Ascend910B3",
+    "results": [
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 16,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 0,
+        "pre_unroll": 52,
+        "blocks": {
+          "kda_pre_gram_mix": 20,
+          "kda_solve_wu_wide": 342,
+          "kda_solve_fused": 1024,
+          "kda_k2_persistent_loop": 16
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 14.76784610748291,
+        "min_ms": 14.592220306396484,
+        "max_ms": 15.421979904174805,
+        "pre_gram_ms": 11.741550639271736,
+        "solve_ms": 2.0925085991621017,
+        "k2_ms": 1.4143101871013641
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 16,
+        "state_dtype": "fp32",
+        "unroll_override": 2,
+        "blocks_override": 0,
+        "pre_unroll": 2,
+        "blocks": {
+          "kda_pre_gram_mix": 512,
+          "kda_solve_wu_wide": 342,
+          "kda_solve_fused": 1024,
+          "kda_k2_persistent_loop": 16
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 14.033177852630615,
+        "min_ms": 13.845379829406738,
+        "max_ms": 14.585419654846191,
+        "pre_gram_ms": 10.967791080474854,
+        "solve_ms": 2.095170319080353,
+        "k2_ms": 1.455908641219139
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 16,
+        "state_dtype": "fp32",
+        "unroll_override": 66,
+        "blocks_override": 0,
+        "pre_unroll": 66,
+        "blocks": {
+          "kda_pre_gram_mix": 16,
+          "kda_solve_wu_wide": 342,
+          "kda_solve_fused": 1024,
+          "kda_k2_persistent_loop": 16
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 17.585467910766603,
+        "min_ms": 17.362459182739258,
+        "max_ms": 18.112619400024414,
+        "pre_gram_ms": 14.50595073401928,
+        "solve_ms": 2.097759395837784,
+        "k2_ms": 1.4765094965696335
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 16,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 4,
+        "pre_unroll": 52,
+        "blocks": {
+          "kda_pre_gram_mix": 20,
+          "kda_solve_wu_wide": 342,
+          "kda_solve_fused": 1024,
+          "kda_k2_persistent_loop": 4
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 18.751008224487304,
+        "min_ms": 18.53693962097168,
+        "max_ms": 19.323020935058594,
+        "pre_gram_ms": 11.742649599909782,
+        "solve_ms": 2.01554037630558,
+        "k2_ms": 5.343839526176453
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 16,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 6,
+        "pre_unroll": 52,
+        "blocks": {
+          "kda_pre_gram_mix": 20,
+          "kda_solve_wu_wide": 342,
+          "kda_solve_fused": 1024,
+          "kda_k2_persistent_loop": 6
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 17.398801612854005,
+        "min_ms": 17.230119705200195,
+        "max_ms": 17.95163917541504,
+        "pre_gram_ms": 11.747749522328377,
+        "solve_ms": 2.0166300237178802,
+        "k2_ms": 4.033738747239113
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 16,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 8,
+        "pre_unroll": 52,
+        "blocks": {
+          "kda_pre_gram_mix": 20,
+          "kda_solve_wu_wide": 342,
+          "kda_solve_fused": 1024,
+          "kda_k2_persistent_loop": 8
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 16.11798620223999,
+        "min_ms": 15.967120170593262,
+        "max_ms": 16.66950035095215,
+        "pre_gram_ms": 11.770099401473999,
+        "solve_ms": 2.0363498479127884,
+        "k2_ms": 2.766849473118782
+      },
+      {
+        "lengths": [
+          8192
+        ],
+        "heads": 16,
+        "state_dtype": "fp32",
+        "unroll_override": 0,
+        "blocks_override": 16,
+        "pre_unroll": 52,
+        "blocks": {
+          "kda_pre_gram_mix": 20,
+          "kda_solve_wu_wide": 342,
+          "kda_solve_fused": 1024,
+          "kda_k2_persistent_loop": 16
+        },
+        "persistent_head_map": "stride",
+        "bitwise_equal": true,
+        "warmup": 5,
+        "iters": 5,
+        "repeats": 2,
+        "mean_ms": 14.800248050689698,
+        "min_ms": 14.548379898071289,
+        "max_ms": 15.45166015625,
+        "pre_gram_ms": 11.736441403627396,
+        "solve_ms": 2.0959600806236267,
+        "k2_ms": 1.4759097248315811
+      }
+    ]
+  }
+}

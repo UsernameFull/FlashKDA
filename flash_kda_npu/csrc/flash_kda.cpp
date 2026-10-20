@@ -62,7 +62,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "rtc_compile",
         [](const std::string &src, const std::string &funcName,
-           const std::vector<size_t> &argSizes) {
+           const std::vector<size_t> &argSizes,
+           const std::vector<std::string> &includeDirs) {
             const auto runtime = CurrentRuntime();
             if (argSizes.empty() || argSizes.size() > MAX_ARGS) {
                 throw std::invalid_argument("kernel ABI must have 1..32 arguments");
@@ -96,6 +97,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                      "asc/impl/utils"}) {
                 optStrs.push_back("-I" + ascBase + "/" + sub);
             }
+            for (const auto &dir : includeDirs) optStrs.push_back("-I" + dir);
             if (const char *extra = std::getenv("KDA_RTC_OPTS")) {
                 std::stringstream ss(extra);
                 std::string tok;
@@ -158,7 +160,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             functions.emplace(funcName, Kernel{fn, bh, key, argSizes});
             return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fn));
         },
-        py::arg("src"), py::arg("func_name"), py::arg("arg_sizes"));
+        py::arg("src"), py::arg("func_name"), py::arg("arg_sizes"),
+        py::arg("include_dirs") = std::vector<std::string>{});
     m.def(
         "launch_argsarray_engine",
         [](const std::string &name, uint32_t numBlocks, uint64_t stream,

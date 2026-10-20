@@ -1,0 +1,101 @@
+{
+  "full_suite": {
+    "tests": "1027",
+    "failures": "0",
+    "errors": "0",
+    "skipped": "12",
+    "time": "427.419",
+    "metrics": {
+      "gate_sweep/output_relative_rms": {
+        "count": 20,
+        "maximum": 0.005652661130462536,
+        "worst_case": "test_cuda_gate_bias_accuracy[varlen-g=-8_bias=0]"
+      },
+      "gate_sweep/output_max_window_relative_rms": {
+        "count": 20,
+        "maximum": 0.006337074557426949,
+        "worst_case": "test_cuda_gate_bias_accuracy[varlen-g=-8_bias=0]"
+      },
+      "gate_sweep/state_relative_rms": {
+        "count": 20,
+        "maximum": 0.007530371490825376,
+        "worst_case": "test_cuda_gate_bias_accuracy[fixed-g=-8_bias=0]"
+      },
+      "matrix/output_relative_rms": {
+        "count": 578,
+        "maximum": 0.008736382013405555,
+        "worst_case": "test_fwd_fixed[in_only-fp32-T8192-H1]"
+      },
+      "matrix/output_max_window_relative_rms": {
+        "count": 578,
+        "maximum": 0.008736782655691966,
+        "worst_case": "test_fwd_varlen[in_only-fp32-seqs1300_547_2048_963_271_3063-H1]"
+      },
+      "matrix/state_relative_rms": {
+        "count": 290,
+        "maximum": 0.0031635645560058544,
+        "worst_case": "test_fwd_fixed[out_only-bf16-T256-H1]"
+      },
+      "matrix/output_post_transient_max_relative_rms": {
+        "count": 178,
+        "maximum": 0.00449639560433255,
+        "worst_case": "test_fwd_batched[in_only-fp32-B8_T128-H1]"
+      }
+    }
+  },
+  "long_suite": {
+    "tests": "8",
+    "failures": "0",
+    "errors": "0",
+    "skipped": "0",
+    "time": "657.753",
+    "metrics": {
+      "matrix/output_relative_rms": {
+        "count": 4,
+        "maximum": 0.008411581125176638,
+        "worst_case": "test_fwd_long_varlen[seqs131072]"
+      },
+      "matrix/output_max_window_relative_rms": {
+        "count": 4,
+        "maximum": 0.00841447154019187,
+        "worst_case": "test_fwd_long_varlen[seqs131072]"
+      },
+      "matrix/output_post_transient_max_relative_rms": {
+        "count": 4,
+        "maximum": 0.004255385858833326,
+        "worst_case": "test_fwd_long_varlen[seqs524288_524288]"
+      },
+      "matrix/state_relative_rms": {
+        "count": 4,
+        "maximum": 0.0028863234302848465,
+        "worst_case": "test_fwd_long[T1048576]"
+      }
+    }
+  },
+  "supplemental": {
+    "chunk16": {
+      "passed": 153,
+      "skipped": 2,
+      "seconds": 54.91
+    },
+    "chunk32": {
+      "passed": 153,
+      "skipped": 2,
+      "seconds": 55.31
+    },
+    "unfused_chunk64": {
+      "passed": 88,
+      "seconds": 50.39
+    },
+    "two_device_context_switch": {
+      "passed": 1,
+      "seconds": 40.38
+    },
+    "cross_device_input_rejection": {
+      "passed": 1,
+      "seconds": 10.42
+    },
+    "all_main_suite_skips_covered": true,
+    "unique_suite_cases_covered": 1027
+  }
+}

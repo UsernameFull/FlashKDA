@@ -1,0 +1,54 @@
+{
+  "schedule_reference": "current csrc/ascendc sources; neither modified nor read by CATLASS RTC",
+  "files": {
+    "fwd_kernel1_pre_gram.cpp": {
+      "sha256": "f707ba051610a43098cb16790eb9343830560caa9de25199d76759af1661093a",
+      "baseline_sha256": "42fed2e8bba9552dde96ffd4034809f68fcfa4f8b440412fa4947d59d80dde6b",
+      "upstream_tile_calls": 54,
+      "raw_mmad_calls": 0,
+      "legacy_include": false
+    },
+    "fwd_kernel1_solve_assemble.cpp": {
+      "sha256": "f38b303cb033987d20a7e7a24f134146b25299957cf846552b388b03e756edb7",
+      "baseline_sha256": "783b25bbb2724b34dbf434fd3caf7c55774d30db4543b071ee8b090c718f456a",
+      "upstream_tile_calls": 1,
+      "raw_mmad_calls": 0,
+      "legacy_include": false
+    },
+    "fwd_kernel1_solve_cube.cpp": {
+      "sha256": "a2f75cc41a57d9afe017f3d8cc955892f8cfc77856b22d48b3f445d7f76c319b",
+      "baseline_sha256": "ffa3eb15de7afdd81bc13491a79345b14e61a37b0b10f4ec58c47c5a3bbc6b5b",
+      "upstream_tile_calls": 6,
+      "raw_mmad_calls": 0,
+      "legacy_include": false
+    },
+    "fwd_kernel1_solve_fused.cpp": {
+      "sha256": "149416b66b43f2d9dc1bb949f7fd56124051f8623b6a0bc8e46181974fcdcb59",
+      "baseline_sha256": "ae3b37cfe266b1817e77c225e7b360d6f1400d153b971b77e2a2c3970c930e9e",
+      "upstream_tile_calls": 0,
+      "raw_mmad_calls": 0,
+      "legacy_include": false
+    },
+    "fwd_kernel1_solve_wide.cpp": {
+      "sha256": "7d8b012033c7270f53b130a9d41774a98dac2228ee1701b143b03549e70da35c",
+      "baseline_sha256": "6c4d0aaeb1e327bb311d650e4dd60472eecc6aa58355cd35152addba4ecc43c6",
+      "upstream_tile_calls": 3,
+      "raw_mmad_calls": 0,
+      "legacy_include": false
+    },
+    "fwd_kernel2_persistent.cpp": {
+      "sha256": "076eb1fd6c8321c291b64520d96f29b9351b6e7e8908e3e205c3b68bf4e818aa",
+      "baseline_sha256": "2e4704749010b3c420ae285099004b55354fd4dc7d7e27cb8701f81617c45be0",
+      "upstream_tile_calls": 29,
+      "raw_mmad_calls": 0,
+      "legacy_include": false
+    },
+    "scheduled_tiles.hpp": {
+      "sha256": "59ffc9478e451182d5d0ee163f02c1fbe58d7f602544cd5e15c21af8576ee409",
+      "baseline_sha256": null,
+      "upstream_tile_calls": 0,
+      "raw_mmad_calls": 0,
+      "legacy_include": false
+    }
+  }
+}

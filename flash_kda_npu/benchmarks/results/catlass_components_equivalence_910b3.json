@@ -1,0 +1,264 @@
+{
+  "baseline": "complete rewrite before upstream vector/copy/sync replacement",
+  "cases": [
+    {
+      "case": "short",
+      "state": "bf16",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        },
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "short",
+      "state": "none",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "short",
+      "state": "fp32",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        },
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "tail",
+      "state": "bf16",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        },
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "tail",
+      "state": "none",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "tail",
+      "state": "fp32",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        },
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "fixed_h16",
+      "state": "bf16",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        },
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "fixed_h16",
+      "state": "none",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "fixed_h16",
+      "state": "fp32",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        },
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "fixed_h96",
+      "state": "bf16",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        },
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "fixed_h96",
+      "state": "none",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "fixed_h96",
+      "state": "fp32",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        },
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "packed",
+      "state": "bf16",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        },
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "packed",
+      "state": "none",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "packed",
+      "state": "fp32",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        },
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "empty_packed",
+      "state": "bf16",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        },
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "empty_packed",
+      "state": "none",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    },
+    {
+      "case": "empty_packed",
+      "state": "fp32",
+      "tensors": [
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        },
+        {
+          "bitwise_equal": true,
+          "finite": true,
+          "max_abs_diff": 0.0
+        }
+      ]
+    }
+  ],
+  "all_bitwise_equal": true
+}

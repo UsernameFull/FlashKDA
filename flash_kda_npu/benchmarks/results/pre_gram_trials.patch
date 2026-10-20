@@ -1,0 +1,117 @@
+--- a/flash_kda_npu/ops/ascendc.py
++++ b/flash_kda_npu/ops/ascendc.py
+@@ -404,7 +404,7 @@
+ 
+ 
+ _SOURCES: list[tuple[str, str, list[int]]] = [
+-    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_pre_gram.cpp", "kda_pre_gram_mix", [8] * 23 + [4] * 8),
++    ("flash_kda_npu/csrc/ascendc/fwd_kernel1_pre_gram.cpp", "kda_pre_gram_mix", [8] * 23 + [4] * 9),
+     ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_wide.cpp", "kda_solve_wu_wide", [8] * 4 + [4]),
+     ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_assemble.cpp", "kda_solve_assemble", [8] * 2 + [4]),
+     ("flash_kda_npu/csrc/ascendc/fwd_kernel1_solve_cube.cpp", "kda_solve_wu_cube_kernel", [8] * 5 + [4]),
+@@ -620,7 +620,14 @@
+     # DataCopy cannot express that gather on this part).
+     qk_row_bytes = h * D * 2 - D * 2
+     g_row_bytes = h * D * 4 - D * 4
+-    if sequence_meta is not None:
++    beta_packed = sequence_meta is not None and os.environ.get("KDA_PRE_BETA_PACK", "0") == "1"
++    if beta_packed:
++        beta_pack = torch.zeros((c, CHUNK), dtype=beta.dtype, device=q.device)
++        for start, length, prefix, count in records[:-1]:
++            if length:
++                beta_pack[prefix * h:(prefix + count) * h].view(h, count * CHUNK)[:, :length].copy_(
++                    beta[0, start:start + length].transpose(0, 1))
++    elif sequence_meta is not None:
+         beta_pack = beta
+     elif t % CHUNK == 0:
+         beta_pack = beta.view(b, nt, CHUNK, h).permute(0, 3, 1, 2).contiguous().view(c, CHUNK)
+@@ -675,7 +682,7 @@
+     pre_args = _pack_ptrs(pre_head + [gram_ops[0], gram_ops[1], gram_ops[2], gram_x]
+                           + pre_tail + [valid_lengths, sequence_meta])
+     pre_args += [_i(sequences), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
+-                 _i(qk_row_bytes), _i(g_row_bytes)]
++                 _i(qk_row_bytes), _i(g_row_bytes), _i(beta_packed)]
+     # One MIX block pairs an AIC with two AIV subcores, so it covers
+     # 2 * pre_unroll chunks.
+     _launch("kda_pre_gram_mix", (c + 2 * pre_unroll - 1) // (2 * pre_unroll),
+--- a/flash_kda_npu/csrc/ascendc/fwd_kernel1_pre_gram.cpp
++++ b/flash_kda_npu/csrc/ascendc/fwd_kernel1_pre_gram.cpp
+@@ -438,7 +438,7 @@
+     GM_ADDR pAqk32, GM_ADDR pAqk16, GM_ADDR pL, GM_ADDR pMaskS, GM_ADDR pMaskL,
+     GM_ADDR pLengths, GM_ADDR pSequences,
+     int32_t B, int32_t T, int32_t H, float lower_bound, float scale, int32_t unroll,
+-    int32_t xRowBytes, int32_t gRowBytes) {
++    int32_t xRowBytes, int32_t gRowBytes, int32_t betaPacked) {
+     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+     // Packed metadata rows: [token start, length, first chunk, chunk count].
+     // The sentinel row holds the total per-head chunk count. All heads of a
+@@ -581,6 +581,9 @@
+     int32_t cprev = -1;
+     int32_t cachedHead = -1;
+     float aexp = 0.0f;
++    int32_t cachedSequence = -1, cachedBegin = 0, cachedEnd = 0;
++    int32_t cachedNt = 0, cachedLength = 0;
++    int64_t cachedStart = 0;
+     for (int32_t u = 0; u < unroll; ++u) {
+     int32_t c = group * 2 * unroll + 2 * u + sub;
+     if (c >= nchunk) c = nchunk - 1;
+@@ -590,19 +593,28 @@
+     int64_t tokenStart = static_cast<int64_t>(sequence) * T;
+     int32_t sequenceLength = T;
+     if (pSequences != nullptr) {
+-        // Find the rightmost sequence prefix <= c. Repeated prefixes are
+-        // empty sequences and must be skipped, including leading empties.
+-        int32_t lo = 0, hi = B;
+-        while (lo + 1 < hi) {
+-            const int32_t mid = lo + (hi - lo) / 2;
+-            if (sequences[mid * 4 + 2] * H <= c) lo = mid;
+-            else hi = mid;
+-        }
+-        sequence = lo;
+-        tokenStart = sequences[lo * 4];
+-        sequenceLength = sequences[lo * 4 + 1];
+-        sequenceNt = sequences[lo * 4 + 3];
+-        localChunk = c - sequences[lo * 4 + 2] * H;
++        // This block visits chunks monotonically. Refresh the sequence
++        // descriptor only on entry or when crossing a sequence boundary.
++        if (c >= cachedEnd) {
++            // Rightmost prefix skips empty sequences, including leading ones.
++            int32_t lo = cachedSequence < 0 ? 0 : cachedSequence, hi = B;
++            while (lo + 1 < hi) {
++                const int32_t mid = lo + (hi - lo) / 2;
++                if (sequences[mid * 4 + 2] * H <= c) lo = mid;
++                else hi = mid;
++            }
++            cachedSequence = lo;
++            cachedStart = sequences[lo * 4];
++            cachedLength = sequences[lo * 4 + 1];
++            cachedNt = sequences[lo * 4 + 3];
++            cachedBegin = sequences[lo * 4 + 2] * H;
++            cachedEnd = cachedBegin + cachedNt * H;
++        }
++        sequence = cachedSequence;
++        tokenStart = cachedStart;
++        sequenceLength = cachedLength;
++        sequenceNt = cachedNt;
++        localChunk = c - cachedBegin;
+     }
+     const int32_t head = localChunk / sequenceNt;
+     const int32_t ck = localChunk % sequenceNt;
+@@ -645,7 +657,7 @@
+         DataCopyPad(alog, Alog[head], DataCopyExtParams(1, sizeof(float), 0, 0, 0),
+                     padScalar);
+     }
+-    if (pSequences == nullptr) {
++    if (pSequences == nullptr || betaPacked) {
+         DataCopy(beta, Beta[cm], DataCopyParams(1, M / 8, 0, 0));
+     } else {
+         // Read one scalar per token into 32-byte UB rows, then compact it
+@@ -663,7 +675,7 @@
+     }
+ 
+     WaitFlag<HardEvent::MTE2_V>(e2vs);
+-    if (pSequences != nullptr) {
++    if (pSequences != nullptr && !betaPacked) {
+         if (validRows < M) {
+             // Each staging row is 32-byte aligned, including one-token tails.
+             Duplicate(bb[validRows * 8], 0.0f, (M - validRows) * 8);

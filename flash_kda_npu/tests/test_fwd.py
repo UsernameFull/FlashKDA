@@ -125,6 +125,59 @@ def test_native_pre_gram_schedule(cores, before, after):
     assert _pre_gram_unroll(12288, 24) == 64
 
 
+@pytest.mark.parametrize("cores,heads,expected", [
+    (20, 96, 40), (20, 128, 40), (20, 768, 256),
+    (20, 32, 16), (24, 96, 24), (32, 96, 32),
+])
+def test_native_fixed_persistent_schedule(cores, heads, expected):
+    from flash_kda_npu.ops.ascendc import _persistent_fixed_blocks
+    assert _persistent_fixed_blocks(heads, cores) == expected
+
+
+@pytest.mark.parametrize("cores", [20, 24, 32])
+def test_native_fixed_persistent_grid_coverage(cores):
+    from flash_kda_npu.ops.ascendc import PERSIST_MAXH, _persistent_fixed_blocks
+    for heads in range(1, 1025):
+        nb = _persistent_fixed_blocks(heads, cores)
+        assert 1 <= nb <= heads
+        assert (heads + nb - 1) // nb <= PERSIST_MAXH
+        mapped = [head for block in range(nb) for head in range(block, heads, nb)]
+        assert sorted(mapped) == list(range(heads))
+
+
+@pytest.mark.parametrize("cores", [20, 24, 32])
+def test_native_varlen_persistent_schedule(cores):
+    from flash_kda_npu.ops.ascendc import _persistent_varlen_blocks
+    # A long sequence mixed with short sequences leaves single-head tails
+    # in the old three-head stride map. Four heads retain more overlap.
+    assert _persistent_varlen_blocks((21, 9, 32, 16, 5, 48), 96, cores, 4, 192) == 144
+    # Equal-length and all-empty batches preserve the existing choice.
+    assert _persistent_varlen_blocks((16,) * 8, 96, cores, 4, 256) == 256
+    assert _persistent_varlen_blocks((0,) * 8, 96, cores, 4, 256) == 256
+    for counts in ((0, 1, 0, 5, 1, 0, 2, 0), (1, 1000), (9, 2, 4)):
+        for heads in (1, 3, 17, 96):
+            bh = len(counts) * heads
+            default = (bh + 3) // 4
+            nb = _persistent_varlen_blocks(counts, heads, cores, 4, default)
+            assert 1 <= nb <= bh and (bh + nb - 1) // nb <= 4
+
+
+@pytest.mark.parametrize("counts,heads,default", [
+    ((21, 9, 32, 16, 5, 48), 96, 144),
+    ((0, 1, 1, 110, 1, 17), 32, 96),
+])
+def test_native_grouped_persistent_plan(counts, heads, default):
+    from flash_kda_npu.ops.ascendc import _persistent_grouped_plan
+    nb, rows = _persistent_grouped_plan(counts, heads, 20, 4, default)
+    assert rows and len(rows) == nb
+    assert sorted(h for row in rows for h in row if h >= 0) == list(range(len(counts) * heads))
+    assert all(len(row) == 4 and any(h >= 0 for h in row) for row in rows)
+    work = [max(counts[h // heads] for h in row if h >= 0) for row in rows]
+    assert work == sorted(work, reverse=True)
+    assert _persistent_grouped_plan((16,) * 8, 96, 20, 4, 256) == (256, ())
+    assert _persistent_grouped_plan((0, 1, 0, 5, 1, 0, 2, 0), 17, 20, 4, 34) == (34, ())
+
+
 @pytest.mark.parametrize("unroll", [1, 3, 8])
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_native_head_parameters(monkeypatch, unroll, with_bias):
@@ -373,10 +426,12 @@ def test_native_varlen_matches_independent_sequences():
 @pytest.mark.parametrize("heads", [1, 3, 7, 17])
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("unroll", [1, 3])
-def test_native_varlen_direct_buffers(monkeypatch, heads, state_dtype, unroll):
+@pytest.mark.parametrize("head_map", ["auto", "stride", "grouped"])
+def test_native_varlen_direct_buffers(monkeypatch, heads, state_dtype, unroll, head_map):
     """Mixed head schedules retire independently, with no full-input packing."""
     from flash_kda_npu.ops import ascendc
     monkeypatch.setenv("KDA_PRE_UNROLL", str(unroll))
+    monkeypatch.setenv("KDA_PERSIST_HEAD_MAP", head_map)
     lengths = [0, 1, 0, ascendc.CHUNK * 4 + 3, 7, 0, ascendc.CHUNK + 1, 0]
     steps = sum(lengths)
     q, k, v, g, beta, a_log, bias = make_inputs(1, steps, heads, "npu")
@@ -404,6 +459,8 @@ def test_native_varlen_direct_buffers(monkeypatch, heads, state_dtype, unroll):
     profile = ascendc.get_last_profile()
     assert profile["packed_direct"] and not profile["input_packing"]
     assert profile["pre_unroll"] == unroll
+    if head_map != "auto":
+        assert profile["persistent_head_map"] == head_map
     assert profile["sequence_groups"] == 1
     assert profile["launch_counts"]["kda_pre_gram_mix"] == 1
     assert profile["launch_counts"]["kda_k2_persistent_loop"] == 1
@@ -468,16 +525,16 @@ def test_launcher_rejects_invalid_abi(bad_args, match):
 
 
 def test_launcher_cache_identity():
-    from flash_kda_npu.ops.ascendc import _SOURCES, _defines, ROOT, rtc_compile
+    from flash_kda_npu.ops.ascendc import _SOURCES, _rtc_spec, rtc_compile
     torch.npu.current_stream()
     rel, name, sizes = next(entry for entry in _SOURCES if entry[1] == "kda_solve_wu_wide")
-    source = _defines() + (ROOT / rel).read_text(encoding="utf-8-sig")
-    first = rtc_compile(source, name, sizes)
-    assert rtc_compile(source, name, sizes) == first
+    source, includes = _rtc_spec(rel, name)
+    first = rtc_compile(source, name, sizes, includes)
+    assert rtc_compile(source, name, sizes, includes) == first
     with pytest.raises(ValueError, match="different source/options/ABI"):
-        rtc_compile(source, name, sizes[:-1])
+        rtc_compile(source, name, sizes[:-1], includes)
     with pytest.raises(ValueError, match="different source/options/ABI"):
-        rtc_compile(source + "\n// changed source", name, sizes)
+        rtc_compile(source + "\n// changed source", name, sizes, includes)
 
 
 def test_native_device_switch():
@@ -510,3 +567,135 @@ def test_native_rejects_cross_device_inputs():
     q, k, v, g, beta, a_log, bias = make_inputs(1, CHUNK, 1, "npu:0", gate_dtype=torch.float32)
     with pytest.raises(ValueError, match="all inputs must be on q's NPU device"):
         kda_bt16_fwd_ascendc(q, k.to("npu:1"), v, g, beta.float(), A_log=a_log, bias=bias)
+
+
+@pytest.mark.parametrize("batch,steps,heads", [(1, 129, 96), (2, 65, 3)])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_native_bf16_gate_matches_fp32(batch, steps, heads, state_dtype):
+    """Moving the exact BF16->FP32 cast into UB must preserve all results."""
+    from flash_kda_npu.ops.ascendc import kda_bt16_fwd_ascendc
+    q, k, v, g, beta, a_log, bias = make_inputs(batch, steps, heads, "npu")
+    initial = make_state(batch, heads, 128, torch.float32, "npu")
+    final = torch.empty_like(initial, dtype=state_dtype)
+    out = torch.empty_like(q)
+    results = []
+    for gate in (g.float(), g):
+        kda_bt16_fwd_ascendc(q, k, v, gate, beta.float(), A_log=a_log, bias=bias,
+                            initial_state=initial, final_state=final,
+                            output_final_state=True, out=out)
+        torch.npu.synchronize()
+        results.append((out.clone(), final.clone()))
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][1], results[1][1])
+
+
+@pytest.mark.parametrize("steps", [64, 129])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_native_graph_replay_changed_inputs(steps, state_dtype):
+    from flash_kda_npu.ops import capture_fwd
+    q, k, v, g, beta, a_log, bias = make_inputs(1, steps, 4, "npu")
+    initial = make_state(1, 4, 128, state_dtype, "npu")
+    final = torch.empty_like(initial)
+    out = torch.empty_like(q)
+    args = (q, k, v, g, beta, 128 ** -0.5, out, a_log, bias, -5.0)
+    captured = capture_fwd(*args, initial_state=initial, final_state=final)
+    for _ in range(2):
+        q.mul_(0.75)
+        g.add_(0.25)
+        beta.add_(0.125)
+        initial.mul_(0.5)
+        flash_kda.fwd(*args, initial_state=initial, final_state=final)
+        torch.npu.synchronize()
+        expected, state = out.clone(), final.clone()
+        out.fill_(float("nan")); final.fill_(float("nan"))
+        captured.replay()
+        torch.npu.synchronize()
+        assert captured.out is out and captured.final_state is final
+        assert torch.equal(out, expected)
+        assert torch.equal(final, state)
+
+
+def test_native_graph_private_workspaces():
+    """Two captures must retain independent scratch and caller buffers."""
+    from flash_kda_npu.ops import capture_fwd
+    captures, expected = [], []
+    for factor in (0.5, 1.5):
+        q, k, v, g, beta, a_log, bias = make_inputs(1, 65, 4, "npu")
+        q.mul_(factor)
+        out = torch.empty_like(q)
+        args = (q, k, v, g, beta, 128 ** -0.5, out, a_log, bias, -5.0)
+        flash_kda.fwd(*args)
+        torch.npu.synchronize()
+        expected.append(out.clone())
+        captures.append(capture_fwd(*args))
+    streams = [torch.npu.Stream(), torch.npu.Stream()]
+    for captured, stream in zip(captures, streams):
+        with torch.npu.stream(stream):
+            captured.replay()
+    torch.npu.synchronize()
+    for captured, result in zip(captures, expected):
+        assert torch.equal(captured.out, result)
+        assert captured.final_state is None
+
+
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_native_auto_graph_cache(monkeypatch, state_dtype):
+    from flash_kda_npu.ops import clear_auto_graph_cache
+    from flash_kda_npu.ops import auto_graph
+    monkeypatch.setenv('KDA_AUTO_GRAPH_WARMUP', '1')
+    monkeypatch.setenv('KDA_AUTO_GRAPH_CACHE_SIZE', '2')
+    clear_auto_graph_cache()
+    q, k, v, g, beta, a_log, bias = make_inputs(1, 65, 4, 'npu')
+    initial = make_state(1, 4, 128, state_dtype, 'npu')
+    final = torch.empty_like(initial)
+    out = torch.empty_like(q)
+    for step in range(4):
+        q.mul_(0.75); g.add_(0.125); initial.mul_(0.5)
+        for mode in ('0', '1'):
+            monkeypatch.setenv('KDA_AUTO_GRAPH', mode)
+            flash_kda.fwd(q, k, v, g, beta, 128 ** -0.5, out, a_log, bias, -5.,
+                          initial_state=initial, final_state=final)
+            torch.npu.synchronize()
+            if mode == '0':
+                expected, state = out.clone(), final.clone()
+            else:
+                assert torch.equal(out, expected)
+                assert torch.equal(final, state)
+    cache = auto_graph._LOCAL.cache
+    assert len(cache) == 1 and next(iter(cache.values()))['graph'] is not None
+    # A changed scalar or output address creates a separate entry and LRU eviction.
+    for scale in (0.25, 0.5):
+        other = torch.empty_like(out)
+        flash_kda.fwd(q, k, v, g, beta, scale, other, a_log, bias, -5.,
+                      initial_state=initial, final_state=final)
+        torch.npu.synchronize()
+        assert len(cache) <= 2
+    clear_auto_graph_cache()
+    assert not cache
+
+
+def test_native_auto_graph_streams_and_bypass(monkeypatch):
+    from flash_kda_npu.ops import auto_graph, clear_auto_graph_cache
+    monkeypatch.setenv('KDA_AUTO_GRAPH', '1')
+    monkeypatch.setenv('KDA_AUTO_GRAPH_WARMUP', '1')
+    clear_auto_graph_cache()
+    q, k, v, g, beta, a_log, bias = make_inputs(1, 64, 4, 'npu')
+    args = (q, k, v, g, beta, 128 ** -0.5, torch.empty_like(q), a_log, bias, -5.)
+    torch.npu.synchronize()
+    streams = [torch.npu.Stream(), torch.npu.Stream()]
+    for stream in streams:
+        with torch.npu.stream(stream):
+            for _ in range(3):
+                flash_kda.fwd(*args)
+        stream.synchronize()  # shared output is used sequentially
+    assert len(auto_graph._LOCAL.cache) == 2
+    assert all(e['graph'] is not None for e in auto_graph._LOCAL.cache.values())
+    before = len(auto_graph._LOCAL.cache)
+    monkeypatch.setenv('KDA_PROFILE', '1')
+    flash_kda.fwd(*args)
+    assert len(auto_graph._LOCAL.cache) == before
+    monkeypatch.setenv('KDA_PROFILE', '0')
+    cu = torch.tensor([0, 32, 64], device='npu', dtype=torch.int64)
+    flash_kda.fwd(*args, cu_seqlens=cu)
+    assert len(auto_graph._LOCAL.cache) == before
+    clear_auto_graph_cache()
